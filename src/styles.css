@@ -1,0 +1,140 @@
+/* Styles for BookmarkBridge plugin */
+
+.bookmark-bridge-ribbon-icon {
+    color: var(--interactive-accent);
+}
+
+/* Settings styles */
+.bookmark-bridge-last-sync,
+.bookmark-bridge-sync-status {
+    margin-top: 8px;
+    padding: 8px;
+    background-color: var(--background-secondary);
+    border-radius: 5px;
+    text-align: center;
+}
+
+.bookmark-bridge-last-sync {
+    font-weight: bold;
+    margin-bottom: 4px;
+}
+
+.bookmark-bridge-sync-status {
+    color: var(--text-normal);
+    font-size: 0.9em;
+    margin-bottom: 15px;
+}
+
+.oauth2-status {
+    padding: 8px;
+    margin: 10px 0;
+    border-radius: 5px;
+    font-weight: bold;
+    text-align: center;
+}
+
+.oauth2-status.connected {
+    background-color: var(--background-success);
+    color: var(--text-success);
+}
+
+.oauth2-status.disconnected {
+    background-color: var(--background-error);
+    color: var(--text-error);
+}
+
+.auth-example {
+    font-size: 0.8em;
+    margin: 5px 0;
+    color: var(--text-muted);
+    font-family: monospace;
+    padding: 4px;
+    background-color: var(--background-secondary-alt);
+    border-radius: 4px;
+}
+
+.error-text {
+    color: var(--text-error);
+}
+
+/* Sync button styling */
+.bookmark-bridge-sync-button {
+    background-color: var(--interactive-accent);
+    color: var(--text-on-accent);
+    font-weight: bold;
+}
+
+/* Storage method dropdown styling */
+.bookmark-bridge-storage-method {
+    margin-bottom: 15px;
+}
+
+/* For the Twitter Bookmarks file */
+.twitter-bookmark-separator {
+    margin: 20px 0;
+    border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.twitter-bookmark-header {
+    font-weight: bold;
+    color: var(--text-accent);
+}
+
+.twitter-bookmark-metadata {
+    font-size: 0.8em;
+    color: var(--text-muted);
+    margin-bottom: 10px;
+}
+
+.bookmark-bridge-template textarea {
+    min-height: 200px;
+    font-family: var(--font-monospace);
+    tab-size: 4;
+}
+
+.setting-item.setting-item-heading + .bookmark-bridge-template-container {
+    padding-top: 12px;
+}
+
+.template-help {
+    padding: 10px;
+    margin-bottom: 15px;
+    border-radius: 5px;
+    background-color: var(--background-secondary);
+    font-size: 0.85em;
+}
+
+.template-help code {
+    background-color: var(--background-primary-alt);
+    padding: 2px 4px;
+    border-radius: 3px;
+    font-family: var(--font-monospace);
+}
+
+/* Documentation button styling */
+.template-docs-button {
+    margin-top: 8px;
+    display: block;
+}
+
+/* Settings container spacing */
+.setting-item {
+    padding-top: 18px;
+    padding-bottom: 18px;
+}
+
+/* File name field styling when visible */
+.single-file-name-setting {
+    margin-top: -12px;
+    margin-bottom: 8px;
+}
+
+/* Rate limit note styling */
+.rate-limit-note {
+    margin-top: 15px;
+    padding: 10px;
+    background-color: var(--background-secondary-alt);
+    border-radius: 4px;
+    font-size: 0.85em;
+    color: var(--text-muted);
+} 
