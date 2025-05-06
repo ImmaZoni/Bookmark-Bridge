@@ -23,6 +23,10 @@ jobs:
           npm install
           npm run build
 
+      - name: Copy additional files
+        run: |
+          cp src/styles.css ./styles.css
+
       - name: Create release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
