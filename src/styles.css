@@ -1,10 +1,29 @@
-/* Styles for BookmarkBridge plugin */
+/* 
+ * Bookmark Bridge Plugin Styles
+ * Twitter/X Bookmark integration for Obsidian.md
+ */
 
+/* ---------------------------------- */
+/* Core UI Elements                   */
+/* ---------------------------------- */
+
+/* Ribbon icon styling */
 .bookmark-bridge-ribbon-icon {
     color: var(--interactive-accent);
 }
 
-/* Settings styles */
+/* Sync button styling */
+.bookmark-bridge-sync-button {
+    background-color: var(--interactive-accent);
+    color: var(--text-on-accent);
+    font-weight: bold;
+}
+
+/* ---------------------------------- */
+/* Settings Tab Styles                */
+/* ---------------------------------- */
+
+/* Status displays */
 .bookmark-bridge-last-sync,
 .bookmark-bridge-sync-status {
     margin-top: 8px;
@@ -25,6 +44,7 @@
     margin-bottom: 15px;
 }
 
+/* Authentication status */
 .oauth2-status {
     padding: 8px;
     margin: 10px 0;
@@ -43,25 +63,9 @@
     color: var(--text-error);
 }
 
-.auth-example {
-    font-size: 0.8em;
-    margin: 5px 0;
-    color: var(--text-muted);
-    font-family: monospace;
-    padding: 4px;
-    background-color: var(--background-secondary-alt);
-    border-radius: 4px;
-}
-
+/* Error text styling */
 .error-text {
     color: var(--text-error);
-}
-
-/* Sync button styling */
-.bookmark-bridge-sync-button {
-    background-color: var(--interactive-accent);
-    color: var(--text-on-accent);
-    font-weight: bold;
 }
 
 /* Storage method dropdown styling */
@@ -69,23 +73,23 @@
     margin-bottom: 15px;
 }
 
-/* For the Twitter Bookmarks file */
-.twitter-bookmark-separator {
-    margin: 20px 0;
-    border-bottom: 1px solid var(--background-modifier-border);
+/* Settings layout and spacing */
+.setting-item {
+    padding-top: 18px;
+    padding-bottom: 18px;
 }
 
-.twitter-bookmark-header {
-    font-weight: bold;
-    color: var(--text-accent);
+/* File name field styling when visible */
+.single-file-name-setting {
+    margin-top: -12px;
+    margin-bottom: 8px;
 }
 
-.twitter-bookmark-metadata {
-    font-size: 0.8em;
-    color: var(--text-muted);
-    margin-bottom: 10px;
-}
+/* ---------------------------------- */
+/* Template Styles                    */
+/* ---------------------------------- */
 
+/* Template textarea */
 .bookmark-bridge-template textarea {
     min-height: 200px;
     font-family: var(--font-monospace);
@@ -96,6 +100,7 @@
     padding-top: 12px;
 }
 
+/* Template help text */
 .template-help {
     padding: 10px;
     margin-bottom: 15px;
@@ -117,16 +122,15 @@
     display: block;
 }
 
-/* Settings container spacing */
-.setting-item {
-    padding-top: 18px;
-    padding-bottom: 18px;
-}
-
-/* File name field styling when visible */
-.single-file-name-setting {
-    margin-top: -12px;
-    margin-bottom: 8px;
+/* Code examples */
+.auth-example {
+    font-size: 0.8em;
+    margin: 5px 0;
+    color: var(--text-muted);
+    font-family: monospace;
+    padding: 4px;
+    background-color: var(--background-secondary-alt);
+    border-radius: 4px;
 }
 
 /* Rate limit note styling */
@@ -137,4 +141,27 @@
     border-radius: 4px;
     font-size: 0.85em;
     color: var(--text-muted);
+}
+
+/* ---------------------------------- */
+/* Twitter Bookmark Formatting        */
+/* ---------------------------------- */
+
+/* Single file mode bookmark separators */
+.twitter-bookmark-separator {
+    margin: 20px 0;
+    border-bottom: 1px solid var(--background-modifier-border);
+}
+
+/* Bookmark headers */
+.twitter-bookmark-header {
+    font-weight: bold;
+    color: var(--text-accent);
+}
+
+/* Bookmark metadata formatting */
+.twitter-bookmark-metadata {
+    font-size: 0.8em;
+    color: var(--text-muted);
+    margin-bottom: 10px;
 } 
