@@ -59,9 +59,14 @@ export class TwitterService {
     private settings: BookmarkBridgeSettings;
     private client: TwitterApi | null = null;
     private logFilePath: string | null = null;
+    private saveSettingsCallback: () => Promise<void>; // Callback to save settings
+    private lastApiCallTime: number = 0;
+    private apiRateLimitWindow: number = 15 * 60 * 1000; // 15 minutes in milliseconds
+    private apiCallsInProgress: boolean = false;
 
-    constructor(settings: BookmarkBridgeSettings) {
+    constructor(settings: BookmarkBridgeSettings, saveSettingsCallback: () => Promise<void>) {
         this.settings = settings;
+        this.saveSettingsCallback = saveSettingsCallback; // Store the callback
         this.initializeClient();
         this.setupLogging();
     }
@@ -98,7 +103,7 @@ export class TwitterService {
         }
     }
 
-    private log(message: string, type: 'info' | 'error' | 'debug' = 'info') {
+    public log(message: string, type: 'info' | 'error' | 'debug' = 'info') {
         const timestamp = new Date().toISOString();
         const logMessage = `[${timestamp}] [${type.toUpperCase()}] ${message}\n`;
         
@@ -147,7 +152,7 @@ export class TwitterService {
     /**
      * Generate a random string to use as state or code verifier
      */
-    private generateRandomString(length: number = 43): string {
+    public generateRandomString(length: number = 43): string {
         const possible = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
         let text = '';
         for (let i = 0; i < length; i++) {
@@ -219,47 +224,45 @@ export class TwitterService {
     }
 
     /**
-     * Generate the authorization URL for OAuth 2.0
+     * Generate the authorization URL for OAuth 2.0 PKCE flow.
+     * The codeVerifier generated here must be stored by the caller and provided
+     * back to settings (e.g. this.settings.codeVerifier) before calling exchangeAuthCodeForToken.
      */
-    public async generateAuthUrl(callbackUrl: string = 'http://127.0.0.1/callback'): Promise<{ url: string, codeVerifier: string, state: string }> {
+    public async generateAuthUrl(state: string): Promise<{ url: string, codeVerifier: string }> {
         if (!this.settings.clientId) {
             this.log('Client ID is required for OAuth 2.0 authorization', 'error');
             throw new Error('Client ID is required for OAuth 2.0 authorization');
         }
 
-        // Generate a random state and code verifier
-        const state = this.generateRandomString();
         const codeVerifier = this.generateRandomString();
+        this.log(`Generated code verifier for PKCE: ${codeVerifier}`, 'debug');
         
-        this.log(`Generated state: ${state}`, 'debug');
-        this.log(`Generated code verifier: ${codeVerifier}`, 'debug');
-        
-        // Generate the code challenge using S256 method
         const codeChallenge = await this.generateCodeChallenge(codeVerifier);
         this.log(`Generated code challenge: ${codeChallenge}`, 'debug');
         
-        // Store the code verifier for later use
-        this.settings.codeVerifier = codeVerifier;
+        // Twitter has exact match validation for redirect URIs
+        // Make sure this EXACTLY matches what's registered in your Twitter Developer Portal
+        const callbackUrl = 'obsidian://bookmark-bridge/callback';
+        this.log(`Using redirect_uri: ${callbackUrl}`, 'info');
+        this.log(`IMPORTANT: This must exactly match your registered Callback URL in Twitter Developer Portal`, 'info');
 
-        // Create the authorization URL
-        const url = new URL('https://x.com/i/oauth2/authorize');
+        const authUrl = new URL('https://x.com/i/oauth2/authorize');
         
-        // Add required parameters
-        url.searchParams.append('response_type', 'code');
-        url.searchParams.append('client_id', this.settings.clientId);
-        url.searchParams.append('redirect_uri', callbackUrl);
-        url.searchParams.append('scope', 'tweet.read users.read bookmark.read');
-        url.searchParams.append('state', state);
-        url.searchParams.append('code_challenge', codeChallenge);
-        url.searchParams.append('code_challenge_method', 'S256');
+        // Required OAuth 2.0 parameters
+        authUrl.searchParams.append('response_type', 'code');
+        authUrl.searchParams.append('client_id', this.settings.clientId);
+        authUrl.searchParams.append('redirect_uri', callbackUrl);
+        // Now that basic auth works, restore the full scopes needed for bookmarks
+        authUrl.searchParams.append('scope', 'bookmark.read tweet.read users.read offline.access'); 
+        authUrl.searchParams.append('state', state);
+        authUrl.searchParams.append('code_challenge', codeChallenge);
+        authUrl.searchParams.append('code_challenge_method', 'S256');
 
-        this.log(`Generated authorization URL: ${url.toString()}`);
+        // Output the complete URL for debugging
+        const urlString = authUrl.toString();
+        this.log(`Generated Auth URL: ${urlString}`, 'debug');
         
-        return {
-            url: url.toString(),
-            codeVerifier: codeVerifier,
-            state: state
-        };
+        return { url: urlString, codeVerifier };
     }
 
     /**
@@ -411,179 +414,202 @@ export class TwitterService {
         });
     }
 
-    public async exchangeAuthCodeForToken(code: string, callbackUrl: string = 'http://127.0.0.1/callback'): Promise<boolean> {
-        if (!this.settings.clientId || !this.settings.codeVerifier) {
-            this.log('Client ID and code verifier are required', 'error');
-            throw new Error('Client ID and code verifier are required');
+    /**
+     * Exchange authorization code for access token (OAuth 2.0 PKCE)
+     */
+    public async exchangeAuthCodeForToken(code: string, callbackUrl: string): Promise<boolean> {
+        this.log(`exchangeAuthCodeForToken: Starting with code: ${code.substring(0, 10)}... and callback URL: ${callbackUrl}`, 'debug');
+        if (!this.settings.clientId) {
+            this.log('Client ID is missing for token exchange', 'error');
+            throw new Error('Client ID is required to exchange authorization code for token.');
+        }
+        // PKCE requires the code_verifier that was used to generate the code_challenge
+        if (!this.settings.codeVerifier) {
+            this.log('Code verifier is missing for token exchange (PKCE)', 'error');
+            throw new Error('Code verifier is required for PKCE flow.');
         }
 
         try {
-            this.log('Exchanging auth code for token...');
-            this.log(`Code: ${code}`, 'debug');
-            this.log(`Code verifier: ${this.settings.codeVerifier}`, 'debug');
-            this.log(`Callback URL: ${callbackUrl}`, 'debug');
+            const tokenUrl = 'https://api.x.com/2/oauth2/token';
             
-            // Prepare the request body
-            const body = new URLSearchParams();
-            body.append('code', code);
-            body.append('grant_type', 'authorization_code');
-            body.append('client_id', this.settings.clientId);
-            body.append('redirect_uri', callbackUrl);
-            body.append('code_verifier', this.settings.codeVerifier);
-            
-            // Convert body to string
-            const postData = body.toString();
+            // Prepare body params as URLSearchParams
+            const bodyParams = new URLSearchParams({
+                'code': code,
+                'grant_type': 'authorization_code',
+                'client_id': this.settings.clientId,
+                'redirect_uri': callbackUrl,
+                'code_verifier': this.settings.codeVerifier
+            });
 
-            // Create Authorization header for confidential clients
-            let headers: Record<string, string> = {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Content-Length': Buffer.byteLength(postData).toString()
+            const options = {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded'
+                }
             };
             
-            if (this.settings.clientSecret) {
-                const credentials = this.safeBase64Encode(`${this.settings.clientId}:${this.settings.clientSecret}`);
-                headers['Authorization'] = `Basic ${credentials}`;
-                this.log('Using client authentication with Basic auth', 'debug');
+            this.log('Sending token exchange request using nodeHttpRequest', 'debug');
+            const response = await this.nodeHttpRequest(tokenUrl, options, bodyParams.toString());
+
+            // Check if request was successful
+            if (response.statusCode >= 200 && response.statusCode < 300) {
+                try {
+                    const data = JSON.parse(response.body);
+                    this.log('Received token exchange response: successful', 'debug');
+                    
+                    // Store the tokens
+                    this.settings.oauth2AccessToken = data.access_token;
+                    this.settings.oauth2RefreshToken = data.refresh_token || '';
+                    
+                    // Clear the code_verifier as it's no longer needed
+                    this.settings.codeVerifier = '';
+                    
+                    // Save settings
+                    await this.saveSettingsCallback();
+                    
+                    // Initialize client with the new token
+                    this.initializeClient();
+                    
+                    return true;
+                } catch (parseError) {
+                    this.log(`Error parsing token response: ${parseError}`, 'error');
+                    return false;
+                }
             } else {
-                this.log('No client secret provided, using client ID in body only', 'debug');
-            }
-
-            this.log(`Request URL: https://api.twitter.com/2/oauth2/token`);
-            this.log(`Request headers: ${JSON.stringify(headers)}`, 'debug');
-            this.log(`Request body: ${postData}`, 'debug');
-
-            try {
-                // Exchange code for token using Node.js https instead of fetch
-                const response = await this.nodeHttpRequest('https://api.twitter.com/2/oauth2/token', {
-                    method: 'POST',
-                    headers: headers
-                }, postData);
-
-                this.log(`Response status: ${response.statusCode}`);
-                
-                // Log response headers for debugging
-                this.log(`Response headers: ${JSON.stringify(response.headers)}`, 'debug');
-                
-                if (response.statusCode < 200 || response.statusCode >= 300) {
-                    try {
-                        const errorData = JSON.parse(response.body);
-                        this.log(`Error exchanging code for token: ${JSON.stringify(errorData)}`, 'error');
-                        throw new Error(`Token exchange failed: ${errorData?.error_description || errorData?.error || 'HTTP Error'}`);
-                    } catch (jsonError) {
-                        // If we can't parse JSON, use the text content
-                        this.log(`Error response (text): ${response.body}`, 'error');
-                        throw new Error(`Token exchange failed: HTTP ${response.statusCode}. Response: ${response.body}`);
-                    }
-                }
-
-                const data = JSON.parse(response.body);
-                this.log('Token exchange successful!');
-                this.log(`Received access token: ${data.access_token.substring(0, 10)}...`, 'debug');
-                if (data.refresh_token) {
-                    this.log('Received refresh token', 'debug');
-                }
-                
-                // Save the tokens
-                this.settings.oauth2AccessToken = data.access_token;
-                if (data.refresh_token) {
-                    this.settings.oauth2RefreshToken = data.refresh_token;
-                }
-                
-                // Initialize client with the new access token
-                this.client = new TwitterApi(data.access_token);
-                
-                return true;
-            } catch (httpError) {
-                this.log(`HTTP error during token exchange: ${httpError}`, 'error');
-                throw httpError;
+                this.log(`Token exchange failed with status ${response.statusCode}: ${response.body}`, 'error');
+                return false;
             }
         } catch (error) {
-            this.log(`Error exchanging code for token: ${error}`, 'error');
-            throw error;
+            this.log(`Error during token exchange: ${error}`, 'error');
+            return false;
         }
     }
 
     /**
      * Refresh the access token using the refresh token
+     * Implements exponential backoff for rate-limited requests
      */
-    public async refreshAccessToken(): Promise<boolean> {
-        if (!this.settings.clientId || !this.settings.oauth2RefreshToken) {
-            this.log('Client ID and refresh token are required for token refresh', 'error');
-            throw new Error('Client ID and refresh token are required');
+    public async refreshAccessToken(retryCount: number = 0, maxRetries: number = 1): Promise<boolean> {
+        if (!this.settings.oauth2RefreshToken) {
+            this.log('No refresh token available to refresh access token.', 'info');
+            return false;
+        }
+        if (!this.settings.clientId) {
+            this.log('Client ID is missing for token refresh', 'error');
+            return false;
+        }
+        
+        // Don't retry if we've reached max retries
+        if (retryCount > maxRetries) {
+            this.log(`Maximum retries (${maxRetries}) reached for token refresh`, 'error');
+            return false;
         }
 
-        try {
-            this.log('Attempting to refresh access token...');
-            
-            // Prepare the request body
-            const body = new URLSearchParams();
-            body.append('refresh_token', this.settings.oauth2RefreshToken);
-            body.append('grant_type', 'refresh_token');
-            body.append('client_id', this.settings.clientId);
-            
-            // Convert body to string
-            const postData = body.toString();
+        // Add exponential backoff if this is a retry
+        if (retryCount > 0) {
+            const backoffMs = Math.pow(2, retryCount) * 1000;
+            this.log(`Applying backoff delay of ${backoffMs}ms before retry #${retryCount}`, 'info');
+            await new Promise(resolve => setTimeout(resolve, backoffMs));
+        }
 
-            // Create Authorization header for confidential clients
-            let headers: Record<string, string> = {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Content-Length': Buffer.byteLength(postData).toString()
-            };
-            
-            if (this.settings.clientSecret) {
-                const credentials = this.safeBase64Encode(`${this.settings.clientId}:${this.settings.clientSecret}`);
-                headers['Authorization'] = `Basic ${credentials}`;
-                this.log('Using client authentication with Basic auth for token refresh', 'debug');
-            } else {
-                this.log('No client secret provided for token refresh', 'debug');
+        this.log('Attempting to refresh access token...', 'debug');
+
+        const tokenUrl = 'https://api.x.com/2/oauth2/token';
+        const bodyParams = new URLSearchParams({
+            'refresh_token': this.settings.oauth2RefreshToken,
+            'grant_type': 'refresh_token',
+            'client_id': this.settings.clientId
+        });
+
+        // Include client_secret only if provided
+        if (this.settings.clientSecret) {
+            bodyParams.append('client_secret', this.settings.clientSecret);
+        }
+
+        const options = {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded'
             }
+        };
 
-            this.log(`Request URL: https://api.twitter.com/2/oauth2/token`);
-            this.log(`Request headers: ${JSON.stringify(headers)}`, 'debug');
-            this.log(`Request body: ${postData}`, 'debug');
+        try {
+            this.log('Sending token refresh request using nodeHttpRequest', 'debug');
+            const response = await this.nodeHttpRequest(tokenUrl, options, bodyParams.toString());
 
-            try {
-                // Request new access token using Node.js https instead of fetch
-                const response = await this.nodeHttpRequest('https://api.twitter.com/2/oauth2/token', {
-                    method: 'POST',
-                    headers: headers
-                }, postData);
-
-                this.log(`Token refresh response status: ${response.statusCode}`);
-
-                if (response.statusCode < 200 || response.statusCode >= 300) {
-                    try {
-                        const errorData = JSON.parse(response.body);
-                        this.log(`Error refreshing token: ${JSON.stringify(errorData)}`, 'error');
-                        throw new Error(`Token refresh failed: ${errorData?.error_description || errorData?.error || 'HTTP Error'}`);
-                    } catch (jsonError) {
-                        // If we can't parse JSON, use the text content
-                        this.log(`Error response (text): ${response.body}`, 'error');
-                        throw new Error(`Token refresh failed: HTTP ${response.statusCode}. Response: ${response.body}`);
+            // Handle rate limiting
+            if (response.statusCode === 429) {
+                this.log('Token refresh rate limited', 'error');
+                
+                // Extract retry-after header or error message for wait time
+                let waitTime = 15 * 60 * 1000; // Default: 15 minutes
+                
+                if (response.headers['retry-after']) {
+                    const retryAfterSecs = parseInt(response.headers['retry-after'] as string, 10);
+                    if (!isNaN(retryAfterSecs)) {
+                        waitTime = retryAfterSecs * 1000;
                     }
                 }
-
-                const data = JSON.parse(response.body);
-                this.log('Token refresh successful!');
                 
-                // Save the new access token
-                this.settings.oauth2AccessToken = data.access_token;
-                if (data.refresh_token) {
-                    this.log('Received new refresh token', 'debug');
-                    this.settings.oauth2RefreshToken = data.refresh_token;
+                // Parse the response to see if there's a more specific wait time
+                try {
+                    const errorData = JSON.parse(response.body);
+                    this.log(`Token refresh response status: ${response.statusCode}`, 'debug');
+                    this.log(`Token refresh response data: ${response.body}`, 'debug');
+                    
+                    // Try to extract wait time from error message if available
+                    if (errorData.error_description && errorData.error_description.includes('wait')) {
+                        const minutesMatch = errorData.error_description.match(/wait (\d+) minutes/i);
+                        if (minutesMatch && minutesMatch[1]) {
+                            const waitMinutes = parseInt(minutesMatch[1], 10);
+                            if (!isNaN(waitMinutes)) {
+                                waitTime = waitMinutes * 60 * 1000;
+                            }
+                        }
+                    }
+                } catch (e) {
+                    // JSON parsing failed, use default wait time
                 }
                 
-                // Initialize client with the new access token
-                this.client = new TwitterApi(data.access_token);
+                this.log(`Rate limited. Need to wait ${Math.ceil(waitTime/1000/60)} minutes before retrying.`, 'error');
                 
-                return true;
-            } catch (httpError) {
-                this.log(`HTTP error during token refresh: ${httpError}`, 'error');
-                throw httpError;
+                // IMPORTANT: Do NOT recursively call the function again here.
+                // Instead return false and let the caller handle the rate limiting
+                return false;
+            }
+
+            // Check if request was successful
+            if (response.statusCode >= 200 && response.statusCode < 300) {
+                try {
+                    const data = JSON.parse(response.body);
+                    this.log('Received token refresh response: successful', 'debug');
+                    
+                    // Update the tokens
+                    this.settings.oauth2AccessToken = data.access_token;
+                    
+                    // Only update refresh token if a new one was provided
+                    if (data.refresh_token) {
+                        this.settings.oauth2RefreshToken = data.refresh_token;
+                    }
+                    
+                    // Save settings
+                    await this.saveSettingsCallback();
+                    
+                    // Re-initialize client with the new token
+                    this.initializeClient();
+                    
+                    return true;
+                } catch (parseError) {
+                    this.log(`Error parsing refresh token response: ${parseError}`, 'error');
+                    return false;
+                }
+            } else {
+                this.log(`Token refresh failed with status ${response.statusCode}: ${response.body}`, 'error');
+                return false;
             }
         } catch (error) {
-            this.log(`Error refreshing access token: ${error}`, 'error');
-            throw error;
+            this.log(`Error during token refresh: ${error}`, 'error');
+            return false;
         }
     }
 
@@ -591,75 +617,62 @@ export class TwitterService {
      * Revoke the current access token
      */
     public async revokeToken(): Promise<boolean> {
-        if (!this.settings.clientId || !this.settings.oauth2AccessToken) {
-            this.log('Client ID and access token are required', 'error');
-            throw new Error('Client ID and access token are required');
+        if (!this.settings.oauth2AccessToken) {
+            this.log('No access token to revoke.', 'info');
+            return true; // Nothing to do
+        }
+        if (!this.settings.clientId) {
+            this.log('Client ID is missing for token revocation.', 'error');
+            // For public clients, client_secret might not be needed. For confidential, it is.
+            // If confidential: add 'Authorization': 'Basic ' + btoa(`${this.settings.clientId}:${this.settings.clientSecret}`) to headers
+            return false; 
+        }
+
+        this.log('Attempting to revoke access token...', 'debug');
+        const revokeUrl = 'https://api.x.com/2/oauth2/revoke';
+        
+        const bodyParams = new URLSearchParams({
+            'token': this.settings.oauth2AccessToken,
+            'token_type_hint': 'access_token', // Or 'refresh_token' if revoking that
+            'client_id': this.settings.clientId // Required for public clients
+        });
+
+        const options: any = {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded'
+            }
+        };
+
+        // For confidential clients, Twitter requires authentication to revoke a token.
+        // This usually means a Basic Auth header with Client ID and Client Secret.
+        if (this.settings.clientSecret) {
+            options.headers['Authorization'] = 'Basic ' + this.safeBase64Encode(`${this.settings.clientId}:${this.settings.clientSecret}`);
         }
 
         try {
-            this.log('Attempting to revoke access token...');
-            
-            // Prepare the request body
-            const body = new URLSearchParams();
-            body.append('token', this.settings.oauth2AccessToken);
-            body.append('client_id', this.settings.clientId);
-            
-            // Convert body to string
-            const postData = body.toString();
+            this.log('Sending token revocation request using nodeHttpRequest', 'debug');
+            const response = await this.nodeHttpRequest(revokeUrl, options, bodyParams.toString());
 
-            // Create Authorization header for confidential clients
-            let headers: Record<string, string> = {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Content-Length': Buffer.byteLength(postData).toString()
-            };
-            
-            if (this.settings.clientSecret) {
-                const credentials = this.safeBase64Encode(`${this.settings.clientId}:${this.settings.clientSecret}`);
-                headers['Authorization'] = `Basic ${credentials}`;
-                this.log('Using client authentication with Basic auth for token revocation', 'debug');
+            // Check if request was successful
+            if (response.statusCode >= 200 && response.statusCode < 300) {
+                this.log('Token successfully revoked.', 'info');
             } else {
-                this.log('No client secret provided for token revocation', 'debug');
-            }
-
-            this.log(`Request URL: https://api.twitter.com/2/oauth2/revoke`);
-            this.log(`Request headers: ${JSON.stringify(headers)}`, 'debug');
-            this.log(`Request body: ${postData}`, 'debug');
-
-            try {
-                // Revoke the token using Node.js https instead of fetch
-                const response = await this.nodeHttpRequest('https://api.twitter.com/2/oauth2/revoke', {
-                    method: 'POST',
-                    headers: headers
-                }, postData);
-
-                this.log(`Token revocation response status: ${response.statusCode}`);
-                
-                if (response.statusCode < 200 || response.statusCode >= 300) {
-                    try {
-                        const errorData = JSON.parse(response.body);
-                        this.log(`Error revoking token: ${JSON.stringify(errorData)}`, 'error');
-                        throw new Error(`Token revocation failed: ${errorData?.error_description || errorData?.error || 'HTTP Error'}`);
-                    } catch (jsonError) {
-                        // If we can't parse JSON, use the text content
-                        this.log(`Error response (text): ${response.body}`, 'error');
-                        throw new Error(`Token revocation failed: HTTP ${response.statusCode}. Response: ${response.body}`);
-                    }
-                }
-                
-                // Clear the tokens
-                this.settings.oauth2AccessToken = '';
-                this.settings.oauth2RefreshToken = '';
-                this.client = null;
-                
-                return true;
-            } catch (httpError) {
-                this.log(`HTTP error during token revocation: ${httpError}`, 'error');
-                throw httpError;
+                // An error here might not be critical if the token was already invalid
+                this.log(`Error revoking token: ${response.statusCode} - ${response.body}`, 'info');
             }
         } catch (error) {
-            this.log(`Error revoking token: ${error}`, 'error');
-            throw error;
+            this.log(`Network or other error during token revocation: ${error}`, 'error');
+        } finally {
+            // Always clear local tokens after attempting revocation
+            this.settings.oauth2AccessToken = '';
+            this.settings.oauth2RefreshToken = '';
+            this.settings.codeVerifier = ''; // Clear any leftover verifier
+            await this.saveSettingsCallback();
+            this.client = null; // Clear the initialized client
+            this.log('Local tokens cleared after revocation attempt.', 'info');
         }
+        return true; // Return true to indicate logout process completed from plugin's perspective
     }
 
     /**
@@ -708,25 +721,74 @@ export class TwitterService {
         }
     }
 
-    public async fetchBookmarks(lastSyncTimestamp: number): Promise<TwitterBookmark[]> {
-        if (!this.client) {
-            this.initializeClient();
-            if (!this.client) {
-                throw new Error('Twitter client not initialized. Check your API credentials or authorize with X.');
-            }
+    /**
+     * Check if we're currently rate limited and should avoid making API calls
+     * @returns True if rate limited, false if okay to proceed
+     */
+    private isRateLimited(): boolean {
+        const now = Date.now();
+        const timeElapsed = now - Math.max(this.lastApiCallTime, this.settings.lastSyncTime);
+        const isLimited = timeElapsed < this.apiRateLimitWindow;
+        
+        if (isLimited) {
+            const timeToWait = Math.ceil((this.apiRateLimitWindow - timeElapsed) / 1000 / 60);
+            this.log(`Rate limited: Need to wait ${timeToWait} more minutes before API call. Last API call: ${new Date(this.lastApiCallTime).toLocaleTimeString()}, Last sync: ${new Date(this.settings.lastSyncTime).toLocaleTimeString()}`, 'info');
+            
+            // Log more detailed debugging information
+            this.log(`Rate limit details: 
+               Current time: ${new Date(now).toISOString()}
+               Last API call: ${new Date(this.lastApiCallTime).toISOString()} 
+               Last sync time: ${new Date(this.settings.lastSyncTime).toISOString()}
+               Time elapsed: ${timeElapsed}ms
+               Rate limit window: ${this.apiRateLimitWindow}ms
+               Time remaining: ${this.apiRateLimitWindow - timeElapsed}ms`, 'debug');
+        } else {
+            this.log(`Not rate limited. Last API call was ${Math.floor(timeElapsed/1000/60)} minutes ago.`, 'debug');
         }
+        
+        return isLimited;
+    }
+    
+    /**
+     * Update the rate limit timestamp after making an API call
+     */
+    private updateRateLimitTimestamp(): void {
+        this.lastApiCallTime = Date.now();
+        this.log(`Updated API rate limit timestamp to ${new Date(this.lastApiCallTime).toISOString()}`, 'debug');
+    }
 
+    public async fetchBookmarks(lastSyncTimestamp: number): Promise<TwitterBookmark[]> {
+        // Prevent concurrent API calls
+        if (this.apiCallsInProgress) {
+            this.log('API call already in progress, aborting', 'info');
+            throw new Error('Another API call is already in progress. Please wait for it to complete.');
+        }
+        
+        // Check if we're rate limited
+        if (this.isRateLimited()) {
+            const timeElapsed = Date.now() - Math.max(this.lastApiCallTime, this.settings.lastSyncTime);
+            const timeToWait = Math.ceil((this.apiRateLimitWindow - timeElapsed) / 1000 / 60);
+            throw new Error(`X API rate limit not reset yet. Please wait approximately ${timeToWait} more minutes before trying again.`);
+        }
+        
+        // Set flag to prevent concurrent calls
+        this.apiCallsInProgress = true;
+        
         try {
-            // Check if we're still in the rate limit waiting period (15 minutes)
-            const now = Date.now();
-            const timeElapsed = now - this.settings.lastSyncTime;
-            const RATE_LIMIT_WINDOW = 15 * 60 * 1000; // 15 minutes in milliseconds
-            
-            if (this.settings.lastSyncTime > 0 && timeElapsed < RATE_LIMIT_WINDOW) {
-                const timeToWait = Math.ceil((RATE_LIMIT_WINDOW - timeElapsed) / 1000 / 60);
-                throw new Error(`X API rate limit not reset yet. Please wait approximately ${timeToWait} more minutes before trying again.`);
+            if (!this.client) {
+                this.initializeClient();
+                if (!this.client) {
+                    throw new Error('Twitter client not initialized. Check your API credentials or authorize with X.');
+                }
             }
+
+            // Update the rate limit timestamp
+            this.updateRateLimitTimestamp();
             
+            // Update the last sync time in settings
+            this.settings.lastSyncTime = Date.now();
+            await this.saveSettingsCallback(); // Save right after updating the timestamp
+                    
             // Get the user's ID first (required for bookmarks endpoint)
             const currentUser = await this.client.v2.me();
             const userId = currentUser.data.id;
@@ -763,9 +825,6 @@ export class TwitterService {
                 
                 this.log(`Making bookmarks request ${requestCount}/${MAX_REQUESTS}${paginationToken ? ' with pagination token' : ''}`);
                 
-                // Update the last sync time
-                this.settings.lastSyncTime = Date.now();
-                
                 // Fetch bookmarks with parameters
                 const bookmarksResponse = await this.client.v2.bookmarks({
                     expansions: ['author_id', 'attachments.media_keys'],
@@ -798,12 +857,14 @@ export class TwitterService {
                     
                     // Not done with initial sync
                     this.settings.initialSyncComplete = false;
+                    await this.saveSettingsCallback(); // Save after updating pagination info
                     break;
                 } else {
                     // No more pages, we've completed the initial sync
                     this.settings.nextPaginationToken = '';
                     this.settings.initialSyncComplete = true;
                     this.log('No more pages available, reached the end of all bookmarks', 'info');
+                    await this.saveSettingsCallback(); // Save after completing sync
                     break;
                 }
             }
@@ -829,22 +890,42 @@ export class TwitterService {
                     waitMessage = `X API rate limit exceeded. Please try again in ${waitMinutes} minutes.`;
                 }
                 
+                this.updateRateLimitTimestamp(); // Update timestamp on rate limit error
                 this.log(waitMessage, 'error');
                 throw new Error(waitMessage);
             }
             
-            // If the token is expired, try to refresh it
-            if (this.settings.oauth2RefreshToken) {
+            // If the token is expired, try to refresh it just once
+            if (this.settings.oauth2RefreshToken && 
+                !this.isRateLimited() && // Only try if not rate limited
+                (errorObj.code === 401 || 
+                 (errorObj.errors && errorObj.errors[0]?.code === 32) || 
+                 /unauthorized/i.test(String(error)))) {
+                
+                this.log('Token may have expired, attempting to refresh once...', 'info');
+                
                 try {
-                    await this.refreshAccessToken();
-                    // Retry with new token
-                    return this.fetchBookmarks(lastSyncTimestamp);
+                    const refreshed = await this.refreshAccessToken();
+                    if (refreshed) {
+                        this.log('Successfully refreshed token, retrying bookmark fetch', 'info');
+                        // Clear the in-progress flag before recursive call
+                        this.apiCallsInProgress = false;
+                        
+                        // IMPORTANT: Don't make recursive calls, use a promise instead
+                        throw new Error('Authentication refreshed. Please try syncing again.');
+                    } else {
+                        this.log('Failed to refresh token', 'error');
+                    }
                 } catch (refreshError) {
-                    this.log(`Failed to refresh token when fetching bookmarks: ${refreshError}`, 'error');
+                    this.log(`Error refreshing token: ${refreshError}`, 'error');
+                    throw new Error(`Authentication error: ${(refreshError as Error).message}`);
                 }
             }
             
             throw new Error(`Failed to fetch bookmarks: ${(error as Error).message}`);
+        } finally {
+            // Always clear the in-progress flag when done
+            this.apiCallsInProgress = false;
         }
     }
     

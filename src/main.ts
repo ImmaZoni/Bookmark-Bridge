@@ -92,23 +92,32 @@ export default class BookmarkBridgePlugin extends Plugin {
 	bookmarkProcessor: BookmarkProcessor;
 	bookmarkStorage: BookmarkStorage;
 	syncTimer: NodeJS.Timeout | null = null;
+	private authState: string | null = null;
+	private currentCodeVerifier: string | null = null; // Store code verifier for the current auth attempt
+	private isSyncCooldown: boolean = false; // Global sync cooldown flag
+	private nextAllowedSyncTime: number = 0; // Timestamp for next allowed sync
 
 	async onload() {
 		await this.loadSettings();
 
-		// Set up log file path if not already set
-		if (!this.settings.logFile) {
-			// Get vault path for log file
-			const basePath = (this.app.vault.adapter as any).basePath || '';
-			this.settings.logFile = `${basePath}/.obsidian/plugins/bookmark-bridge/bookmark-bridge-log.txt`;
-			console.log(`[Bookmark Bridge] Setting log file path to: ${this.settings.logFile}`);
-			await this.saveSettings();
-		}
-
-		// Initialize services
-		this.twitterService = new TwitterService(this.settings);
+		// Initialize services FIRST, so logging is available
+		this.twitterService = new TwitterService(this.settings, this.saveSettings.bind(this));
 		this.bookmarkStorage = new BookmarkStorage(this.app);
 		this.bookmarkProcessor = new BookmarkProcessor(this.app, this.settings, this.bookmarkStorage);
+
+		if (!this.settings.logFile) {
+			const basePath = (this.app.vault.adapter as any).basePath || '';
+			this.settings.logFile = `${basePath}/.obsidian/plugins/bookmark-bridge/bookmark-bridge-log.txt`;
+			// Log only after twitterService is initialized if using its log method here
+			await this.saveSettings(); // Save settings first
+			this.twitterService.log(`Setting log file path to: ${this.settings.logFile}`, 'info');
+		}
+
+		// Log important setup information that can help users troubleshoot
+		this.logOAuthSetupInstructions();
+		
+		// Register protocol handlers for Twitter OAuth callback
+		this.registerProtocolHandlers();
 
 		// Add the plugin icon to the left ribbon.
 		const ribbonIconEl = this.addRibbonIcon('bookmark', 'Bookmark Bridge', async () => {
@@ -125,23 +134,45 @@ export default class BookmarkBridgePlugin extends Plugin {
 			}
 		});
 
+		// Add test command to check if protocol handler works
+		this.addCommand({
+			id: 'test-protocol-handler',
+			name: 'Test Protocol Handler (Debug)',
+			callback: () => {
+				// Generate test data similar to what Twitter would send
+				const testState = this.authState || this.twitterService.generateRandomString(32);
+				if (!this.authState) this.authState = testState;
+				
+				const testCode = this.twitterService.generateRandomString(20);
+				
+				// Create a test URL using the EXACT format Twitter would use
+				const testUrl = `obsidian://bookmark-bridge/callback?code=${testCode}&state=${testState}`;
+				this.twitterService.log(`TEST: Opening test URL to check protocol handler: ${testUrl}`, 'info');
+				
+				// Try to open the URL, which should trigger our protocol handler
+				window.open(testUrl);
+				
+				new Notice("Opened test protocol URL. Check logs to see if handler was triggered.");
+			}
+		});
+
 		// Add settings tab
 		this.addSettingTab(new BookmarkBridgeSettingTab(this.app, this));
 		
-		console.log(`[Bookmark Bridge] Plugin loaded. Storage method: ${this.settings.storageMethod}, Single file: ${this.settings.singleFileName}`);
+		this.twitterService.log(`Plugin loaded. Storage method: ${this.settings.storageMethod}, Single file: ${this.settings.singleFileName}`, 'info');
 		
-		// Start automatic sync if enabled
 		if (this.settings.autoSync) {
 			this.startAutoSync();
 		}
 	}
 
 	startAutoSync() {
-		console.log('[Bookmark Bridge] Starting automatic sync system');
+		this.twitterService.log('Starting automatic sync system', 'info');
 		
-		// Check if we're already syncing
-		if (this.settings.syncInProgress) {
-			console.log('[Bookmark Bridge] Sync already in progress, not starting a new one');
+		// Prevent starting sync if we're in cooldown or a sync is already in progress
+		if (this.isSyncCooldown || this.settings.syncInProgress) {
+			const reason = this.isSyncCooldown ? 'sync cooldown active' : 'sync already in progress';
+			this.twitterService.log(`Not starting auto-sync: ${reason}`, 'info');
 			return;
 		}
 		
@@ -155,10 +186,51 @@ export default class BookmarkBridgePlugin extends Plugin {
 		this.checkAndScheduleSync();
 	}
 	
+	/**
+	 * Check if we're in a rate-limit cooldown period
+	 * @returns True if we're in cooldown, false if it's okay to sync
+	 */
+	private isInCooldown(): boolean {
+		const now = Date.now();
+		const cooldown = now < this.nextAllowedSyncTime;
+		
+		if (cooldown) {
+			const waitSeconds = Math.ceil((this.nextAllowedSyncTime - now) / 1000);
+			this.twitterService.log(`In cooldown period. Need to wait ${waitSeconds} seconds before next sync.`, 'debug');
+		}
+		
+		return cooldown;
+	}
+	
+	/**
+	 * Set a cooldown period before the next sync can be attempted
+	 * @param durationMs The cooldown duration in milliseconds
+	 */
+	private setCooldown(durationMs: number): void {
+		this.isSyncCooldown = true;
+		this.nextAllowedSyncTime = Date.now() + durationMs;
+		const cooldownMinutes = Math.ceil(durationMs / 1000 / 60);
+		
+		this.twitterService.log(`Setting sync cooldown for ${cooldownMinutes} minutes`, 'info');
+		
+		// Set up the cooldown expiry timer
+		setTimeout(() => {
+			this.twitterService.log('Sync cooldown period expired', 'info');
+			this.isSyncCooldown = false;
+		}, durationMs);
+	}
+	
 	async checkAndScheduleSync() {
 		// Don't proceed if no valid credentials
 		if (!this.validateSettings(false)) {
-			console.log('[Bookmark Bridge] Cannot start auto-sync: missing required settings');
+			this.twitterService.log('Cannot start auto-sync: missing required settings', 'error');
+			return;
+		}
+		
+		// Don't schedule a new sync if one is already in progress or we're in cooldown
+		if (this.settings.syncInProgress || this.isInCooldown()) {
+			const reason = this.settings.syncInProgress ? 'sync in progress' : 'in cooldown period';
+			this.twitterService.log(`Not scheduling sync: ${reason}`, 'info');
 			return;
 		}
 		
@@ -173,33 +245,77 @@ export default class BookmarkBridgePlugin extends Plugin {
 			
 			if (this.settings.lastSyncTime === 0 || timeElapsed >= RATE_LIMIT_WINDOW) {
 				// We can sync now - either first sync ever or rate limit window passed
-				console.log(`[Bookmark Bridge] Auto-starting sync ${this.settings.lastSyncPage > 0 ? 'continuation' : 'initial'}`);
-				this.syncBookmarks(true);
+				this.twitterService.log(`Auto-starting sync ${this.settings.lastSyncPage > 0 ? 'continuation' : 'initial'}`, 'info');
+				await this.syncBookmarks(true);
 			} else {
 				// We need to wait for the rate limit window
 				const timeToWait = RATE_LIMIT_WINDOW - timeElapsed;
-				console.log(`[Bookmark Bridge] Rate limit not reset yet, scheduling next auto-sync in ${Math.ceil(timeToWait/1000)} seconds`);
+				const minutesToWait = Math.ceil(timeToWait/1000/60);
+				this.twitterService.log(`Rate limit not reset yet, scheduling next auto-sync in ${minutesToWait} minutes`, 'info');
+				
+				// Make sure we're not in "sync in progress" state
+				this.settings.syncInProgress = false;
+				await this.saveSettings();
+				
+				// Set cooldown to prevent other sync attempts
+				this.setCooldown(timeToWait); 
 				
 				// Schedule the next sync
+				if (this.syncTimer) {
+					clearTimeout(this.syncTimer);
+				}
+				
 				this.syncTimer = setTimeout(() => {
-					console.log('[Bookmark Bridge] Auto-sync timer triggered');
+					this.twitterService.log('Auto-sync timer triggered after rate limit window', 'info');
+					// We're not awaiting this to prevent blocking
 					this.syncBookmarks(true);
 				}, timeToWait);
 			}
 		} else if (this.settings.autoSync) {
 			// Initial sync complete, but we'll check again in 1 hour for new bookmarks
 			const CHECK_INTERVAL = 60 * 60 * 1000; // 1 hour in milliseconds
-			console.log(`[Bookmark Bridge] Initial sync complete, scheduling routine check in 1 hour`);
+			this.twitterService.log(`Initial sync complete, scheduling routine check in 1 hour`, 'info');
+			
+			// Set a short cooldown to prevent immediate re-triggering
+			this.setCooldown(30 * 1000); // 30 second cooldown
+			
+			if (this.syncTimer) {
+				clearTimeout(this.syncTimer);
+			}
 			
 			this.syncTimer = setTimeout(() => {
-				console.log('[Bookmark Bridge] Routine sync check triggered');
+				this.twitterService.log('Routine sync check triggered', 'info');
+				// We're not awaiting this to prevent blocking
 				this.syncBookmarks(true);
 			}, CHECK_INTERVAL);
 		}
 	}
 
 	async syncBookmarks(isAutoSync: boolean = false) {
+		// Don't sync if we don't have required settings
 		if (!this.validateSettings(!isAutoSync)) {
+			return;
+		}
+		
+		// Check if we're in cooldown or a sync is already in progress
+		if (this.isInCooldown()) {
+			const waitTimeMs = this.nextAllowedSyncTime - Date.now();
+			const waitMinutes = Math.ceil(waitTimeMs / 1000 / 60);
+			const message = `Rate limit cooldown active. Please wait approximately ${waitMinutes} more minutes before syncing.`;
+			
+			this.twitterService.log(message, 'info');
+			if (!isAutoSync) {
+				new Notice(message, 5000);
+			}
+			return;
+		}
+		
+		// Check if a sync is already in progress
+		if (this.settings.syncInProgress) {
+			this.twitterService.log('Sync already in progress, not starting a new one', 'info');
+			if (!isAutoSync) {
+				new Notice('A sync is already in progress. Please wait for it to complete.');
+			}
 			return;
 		}
 		
@@ -214,82 +330,147 @@ export default class BookmarkBridgePlugin extends Plugin {
 				notice = new Notice('Syncing Twitter bookmarks...', 0);
 			}
 			
-			console.log(`[Bookmark Bridge] Starting bookmark sync. Storage method: ${this.settings.storageMethod}, Auto: ${isAutoSync}`);
+			this.twitterService.log(`Starting bookmark sync. Storage method: ${this.settings.storageMethod}, Auto: ${isAutoSync}`, 'info');
 			if (this.settings.storageMethod === 'single') {
-				console.log(`[Bookmark Bridge] Using single file mode with file: ${this.settings.singleFileName}`);
+				this.twitterService.log(`Using single file mode with file: ${this.settings.singleFileName}`, 'info');
 			}
 			
 			// Get bookmarks from Twitter API
-			const bookmarks = await this.twitterService.fetchBookmarks(this.settings.lastSyncTimestamp);
-			
-			if (bookmarks.length === 0) {
-				console.log(`[Bookmark Bridge] No new bookmarks found`);
-				if (notice) {
-					notice.setMessage('No new bookmarks found.');
-					setTimeout(() => notice?.hide(), 3000);
+			try {
+				const bookmarks = await this.twitterService.fetchBookmarks(this.settings.lastSyncTimestamp);
+				
+				if (bookmarks.length === 0) {
+					this.twitterService.log(`No new bookmarks found`, 'info');
+					if (notice) {
+						notice.setMessage('No new bookmarks found.');
+						setTimeout(() => notice?.hide(), 3000);
+					}
+					
+					// Set a cooldown to prevent retrying too soon
+					this.setCooldown(60 * 1000); // 1 minute cooldown after successful empty response
+					
+					// If this was an auto-sync, schedule the next check
+					if (isAutoSync) {
+						this.settings.syncInProgress = false;
+						await this.saveSettings();
+						// Use setTimeout to avoid recursive call
+						setTimeout(() => this.checkAndScheduleSync(), 1000);
+					}
+					return;
+				}
+	
+				this.twitterService.log(`Retrieved ${bookmarks.length} bookmarks, processing...`, 'info');
+				
+				// Process and save bookmarks
+				try {
+					await this.bookmarkProcessor.processBookmarks(bookmarks);
+					this.twitterService.log(`Successfully processed ${bookmarks.length} bookmarks`, 'info');
+				} catch (processingError) {
+					this.twitterService.log(`Error processing bookmarks: ${(processingError as Error).message}`, 'error');
+					throw new Error(`Error processing bookmarks: ${(processingError as Error).message}`);
+				}
+	
+				// Only update the lastSyncTimestamp if we've completed the initial sync
+				if (this.settings.initialSyncComplete) {
+					this.settings.lastSyncTimestamp = Date.now();
+					this.twitterService.log(`Updated last sync timestamp to ${new Date(this.settings.lastSyncTimestamp).toISOString()}`, 'info');
 				}
 				
-				// If this was an auto-sync, schedule the next check
+				// Save settings to persist pagination state
+				this.settings.syncInProgress = false;
+				await this.saveSettings();
+	
+				// Update notice if this was a manual sync
+				if (notice) {
+					if (this.settings.initialSyncComplete) {
+						notice.setMessage(`Successfully synced ${bookmarks.length} bookmark(s).`);
+					} else {
+						notice.setMessage(`Synced ${bookmarks.length} bookmark(s). More bookmarks available - continuing automatic sync.`);
+					}
+					setTimeout(() => notice?.hide(), 5000);
+				}
+				
+				// Set standard cooldown after successful sync
+				const cooldownTime = 15 * 60 * 1000; // 15 minutes standard cooldown
+				this.setCooldown(cooldownTime);
+				
+				// If this was an auto-sync, schedule the next check after a delay
 				if (isAutoSync) {
-					this.settings.syncInProgress = false;
-					await this.saveSettings();
-					this.checkAndScheduleSync();
+					// Use setTimeout to avoid recursive call
+					setTimeout(() => this.checkAndScheduleSync(), 2000);
 				}
-				return;
+			} catch (fetchError) {
+				// Handle rate limiting errors in a user-friendly way
+				let errorMessage = (fetchError as Error).message;
+				this.twitterService.log(`Error fetching bookmarks: ${errorMessage}`, 'error');
+				
+				// Special handling for token refresh success
+				if (errorMessage.includes('Authentication refreshed')) {
+					// Token was refreshed, but we need to wait before trying again
+					this.twitterService.log('Access token refreshed successfully, scheduling retry with cooldown', 'info');
+					
+					// Set a moderate cooldown before retrying after token refresh
+					const cooldownTime = 30 * 1000; // 30 seconds
+					this.setCooldown(cooldownTime);
+					
+					if (notice) {
+						notice.setMessage('Authentication renewed. Will retry shortly.');
+						setTimeout(() => notice?.hide(), 5000);
+					}
+					
+					// If auto-sync, schedule a retry
+					if (isAutoSync) {
+						setTimeout(() => {
+							this.twitterService.log('Retrying sync after token refresh...', 'info');
+							this.syncBookmarks(true);
+						}, cooldownTime + 1000);
+					}
+					
+					return;
+				}
+				
+				if (notice) {
+					if (errorMessage.includes('rate limit') || errorMessage.includes('Please wait')) {
+						notice.setMessage(`Rate limit reached. ${errorMessage}`);
+					} else {
+						notice.setMessage(`Error syncing bookmarks: ${errorMessage}`);
+					}
+					setTimeout(() => notice?.hide(), 10000);
+				}
+				
+				// Set appropriate cooldown after error
+				let cooldownTime = 5 * 60 * 1000; // Default: 5 minutes cooldown
+				
+				// If rate limited, extract the waiting time from the error message
+				if (errorMessage.includes('wait approximately')) {
+					const minutesMatch = errorMessage.match(/wait approximately (\d+) more minutes/);
+					if (minutesMatch && minutesMatch[1]) {
+						const waitMinutes = parseInt(minutesMatch[1], 10);
+						// Add a small buffer (1 minute) to ensure the rate limit has expired
+						cooldownTime = (waitMinutes + 1) * 60 * 1000;
+					}
+				}
+				
+				this.setCooldown(cooldownTime);
+				
+				// If this was an auto-sync, schedule the next attempt appropriately
+				if (isAutoSync) {
+					// Schedule the retry with a delay
+					if (this.syncTimer) {
+						clearTimeout(this.syncTimer);
+					}
+					
+					this.syncTimer = setTimeout(() => {
+						this.twitterService.log(`Retrying sync after error cooldown of ${Math.round(cooldownTime / 60000)} minutes`, 'info');
+						// Note: we're not awaiting this to prevent blocking
+						this.syncBookmarks(true);
+					}, cooldownTime + 1000); // Add 1 second to ensure cooldown has expired
+				}
 			}
-
-			console.log(`[Bookmark Bridge] Retrieved ${bookmarks.length} bookmarks, processing...`);
-			
-			// Process and save bookmarks
-			try {
-				await this.bookmarkProcessor.processBookmarks(bookmarks);
-				console.log(`[Bookmark Bridge] Successfully processed ${bookmarks.length} bookmarks`);
-			} catch (processingError) {
-				console.error(`[Bookmark Bridge] Error processing bookmarks:`, processingError);
-				throw new Error(`Error processing bookmarks: ${(processingError as Error).message}`);
-			}
-
-			// Only update the lastSyncTimestamp if we've completed the initial sync
-			if (this.settings.initialSyncComplete) {
-				this.settings.lastSyncTimestamp = Date.now();
-				console.log(`[Bookmark Bridge] Updated last sync timestamp to ${new Date(this.settings.lastSyncTimestamp).toISOString()}`);
-			}
-			
-			// Save settings to persist pagination state
+		} finally {
+			// Always clear the sync in progress flag
 			this.settings.syncInProgress = false;
 			await this.saveSettings();
-
-			// Update notice if this was a manual sync
-			if (notice) {
-				if (this.settings.initialSyncComplete) {
-					notice.setMessage(`Successfully synced ${bookmarks.length} bookmark(s).`);
-				} else {
-					notice.setMessage(`Synced ${bookmarks.length} bookmark(s). More bookmarks available - continuing automatic sync.`);
-				}
-				setTimeout(() => notice?.hide(), 5000);
-			}
-			
-			// If this was an auto-sync, schedule the next check
-			if (isAutoSync) {
-				this.checkAndScheduleSync();
-			}
-		} catch (error) {
-			console.error(`[Bookmark Bridge] Error syncing bookmarks:`, error);
-			this.settings.syncInProgress = false;
-			await this.saveSettings();
-			
-			if (!isAutoSync) {
-				new Notice(`Error syncing bookmarks: ${(error as Error).message}`, 5000);
-			}
-			
-			// Schedule next auto-sync attempt even if there was an error
-			if (isAutoSync) {
-				const RETRY_DELAY = 5 * 60 * 1000; // 5 minutes retry for errors
-				this.syncTimer = setTimeout(() => {
-					console.log('[Bookmark Bridge] Retrying auto-sync after error');
-					this.syncBookmarks(true);
-				}, RETRY_DELAY);
-			}
 		}
 	}
 
@@ -341,6 +522,220 @@ export default class BookmarkBridgePlugin extends Plugin {
 	async saveSettings() {
 		await this.saveData(this.settings);
 	}
+
+	// Method to initiate authentication from settings tab
+	async initiateTwitterAuth() {
+		this.twitterService.log("initiateTwitterAuth: Called", 'debug');
+		if (!this.settings.clientId) {
+			new Notice("Please enter your Twitter Client ID in the settings.");
+			this.twitterService.log("initiateTwitterAuth: Client ID missing", 'error');
+			return;
+		}
+		try {
+			this.authState = this.twitterService.generateRandomString(32);
+			this.twitterService.log(`initiateTwitterAuth: Generated state: ${this.authState}`, 'debug');
+			
+			const { url: authUrl, codeVerifier } = await this.twitterService.generateAuthUrl(this.authState);
+			this.twitterService.log(`initiateTwitterAuth: Generated auth URL: ${authUrl}`, 'debug');
+			this.currentCodeVerifier = codeVerifier; // Store in class member
+			this.twitterService.log(`initiateTwitterAuth: Stored currentCodeVerifier: ${this.currentCodeVerifier ? this.currentCodeVerifier.substring(0, 10) + '...' : 'null'}`, 'debug');
+
+			// No longer saving codeVerifier to this.settings here
+			this.twitterService.log("AUTHENTICATION FLOW START: Opening browser for Twitter OAuth. After authorizing, you should be redirected back to Obsidian.", 'info');
+			this.twitterService.log("If you're seeing a 'Something went wrong' error from Twitter, check that your callback URL in Twitter Developer Portal EXACTLY matches: obsidian://bookmark-bridge/callback", 'info');
+
+			new Notice("Redirecting to Twitter for authentication... Please complete the process in your browser.");
+			window.open(authUrl);
+		} catch (error) {
+			this.twitterService.log(`initiateTwitterAuth: Error initiating Twitter auth: ${(error as Error).message}`, 'error');
+			new Notice("Error initiating Twitter authentication. Check console/log file.");
+			this.authState = null;
+			this.currentCodeVerifier = null; // Clear class member
+		}
+	}
+
+	async handleAuthCallback(params: Record<string, string>) {
+		this.twitterService.log(`handleAuthCallback: Called with params: ${JSON.stringify(params)}`, 'debug');
+
+		// Guard: Prevent duplicate/looping calls if state is already cleared
+		if (!this.authState || !this.currentCodeVerifier) {
+			this.twitterService.log('handleAuthCallback: Ignoring callback because authState or currentCodeVerifier is null (already processed or invalid state).', 'error');
+			return;
+		}
+		
+		// Try to extract code and state from the parameters
+		let code = params.code;
+		let state = params.state;
+		
+		// Log the parameters we're working with
+		this.twitterService.log(`Parameters received: ${JSON.stringify(params)}`, 'info');
+		
+		// Check if the code/state might be embedded in a path segment
+		if (!code && params.callback && typeof params.callback === 'string') {
+			// If the callback path segment contains the code and state
+			this.twitterService.log("Attempting to extract code/state from callback path segment", 'debug');
+			try {
+				// First try parsing as a URL query string
+				if (params.callback.includes('?')) {
+					const callbackUrl = "https://dummy.com/" + params.callback;
+					const urlObj = new URL(callbackUrl);
+					code = urlObj.searchParams.get('code') || code;
+					state = urlObj.searchParams.get('state') || state;
+					this.twitterService.log(`Extracted from URL: code=${code?.substring(0,10)}..., state=${state}`, 'debug');
+				} 
+				// If no question mark, try parsing as a standalone query string
+				else if (params.callback.includes('code=') || params.callback.includes('state=')) {
+					const queryParams = new URLSearchParams(params.callback);
+					code = queryParams.get('code') || code;
+					state = queryParams.get('state') || state;
+					this.twitterService.log(`Extracted from query string: code=${code?.substring(0,10)}..., state=${state}`, 'debug');
+				}
+			} catch (e) {
+				this.twitterService.log(`Failed to parse callback: ${e}`, 'error');
+			}
+		}
+		
+		const currentNotice = new Notice("Processing Twitter authentication callback...", 0);
+		this.twitterService.log(`Final extracted code: ${code ? code.substring(0, 10) + '...' : 'null'}`, 'debug');
+		this.twitterService.log(`Final extracted state: ${state}`, 'debug');
+		this.twitterService.log(`Expected state (this.authState): ${this.authState}`, 'debug');
+
+		// Validate state parameter to prevent CSRF
+		if (!state || state !== this.authState) {
+			this.twitterService.log("handleAuthCallback: Invalid state parameter.", 'error');
+			this.twitterService.log(`Received state: "${state}", Expected state: "${this.authState}"`, 'error');
+			currentNotice.setMessage("Authentication failed: Invalid state. Please try again.");
+			setTimeout(() => currentNotice.hide(), 5000);
+			this.authState = null;
+			this.currentCodeVerifier = null;
+			return;
+		}
+		
+		this.authState = null; // Clear state after use
+		this.twitterService.log("State validated and cleared.", 'debug');
+
+		// Validate code parameter
+		if (!code) {
+			this.twitterService.log("No authorization code received.", 'error');
+			currentNotice.setMessage("Authentication failed: No authorization code received.");
+			setTimeout(() => currentNotice.hide(), 5000);
+			this.currentCodeVerifier = null;
+			return;
+		}
+
+		// Validate code verifier
+		if (!this.currentCodeVerifier) {
+			this.twitterService.log("Critical error - currentCodeVerifier is null before token exchange.", 'error');
+			currentNotice.setMessage("Authentication error: Missing internal verifier. Please try again.");
+			setTimeout(() => currentNotice.hide(), 5000);
+			return;
+		}
+		
+		// Temporarily set codeVerifier in settings for TwitterService to use, then clear it
+		this.settings.codeVerifier = this.currentCodeVerifier;
+		this.currentCodeVerifier = null; // Clear immediately after assigning to settings for the service call
+		this.twitterService.log(`Assigned currentCodeVerifier to settings.codeVerifier for service call: ${this.settings.codeVerifier ? this.settings.codeVerifier.substring(0, 10) + '...' : 'null'}`, 'debug');
+
+		try {
+			// Use same callbackUrl as in generateAuthUrl - this must match EXACTLY what was used in the auth request
+			const callbackUrl = 'obsidian://bookmark-bridge/callback';
+			this.twitterService.log("Attempting to exchange auth code for token...", 'debug');
+			const success = await this.twitterService.exchangeAuthCodeForToken(code, callbackUrl);
+
+			if (success) {
+				this.twitterService.log("Token exchange successful.", 'info');
+				currentNotice.setMessage("Successfully authenticated with Twitter!");
+				setTimeout(() => currentNotice.hide(), 5000);
+				
+				// Force refresh the settings tab UI
+				this.refreshSettingsUI();
+			} else {
+				this.twitterService.log("Token exchange failed.", 'error');
+				currentNotice.setMessage("Failed to obtain access token from Twitter. Check log file.");
+				setTimeout(() => currentNotice.hide(), 5000);
+			}
+		} catch (error) {
+			this.twitterService.log(`Error exchanging auth code for token: ${(error as Error).message}`, 'error');
+			currentNotice.setMessage("Error during Twitter authentication. Check log file.");
+			setTimeout(() => currentNotice.hide(), 5000);
+		} finally {
+			this.twitterService.log("Entering finally block.", 'debug');
+			// Always clear state after any attempt
+			this.authState = null;
+			this.currentCodeVerifier = null;
+			// Ensure codeVerifier is cleared from settings (it should have been by exchangeAuthCodeForToken on success)
+			if (this.settings.codeVerifier !== '') {
+				this.twitterService.log("Clearing settings.codeVerifier in finally block.", 'debug');
+				this.settings.codeVerifier = '';
+				await this.saveSettings();
+			}
+		}
+	}
+
+	/**
+	 * Attempt to refresh the settings UI after changes
+	 */
+	private refreshSettingsUI(): void {
+		this.twitterService.log("Attempting to refresh settings tab UI...", 'debug');
+		
+		try {
+			// Method 1: Try using the setting instance from app
+			const settingsInstance = (this.app as any).setting;
+			if (settingsInstance && settingsInstance.settingTabs) {
+				const settingTab = settingsInstance.settingTabs.find((tab: PluginSettingTab) => tab instanceof BookmarkBridgeSettingTab);
+				if (settingTab) {
+					this.twitterService.log("Found settings tab instance, refreshing UI", 'debug');
+					// Force a complete UI refresh by clearing the container first
+					(settingTab as BookmarkBridgeSettingTab).containerEl.empty();
+					(settingTab as BookmarkBridgeSettingTab).display();
+				} else {
+					this.twitterService.log("Settings tab not found in settingTabs", 'debug');
+				}
+			}
+			
+			// Method 2: Try to open the settings tab which should trigger a refresh
+			this.twitterService.log("Trying to open plugin settings tab to force refresh", 'debug');
+			(this.app as any).setting.open('bookmark-bridge');
+			
+		} catch (uiError) {
+			this.twitterService.log(`Error refreshing settings UI: ${uiError}`, 'error');
+		}
+	}
+
+	// Add detailed instructions for setting up OAuth correctly in Twitter Developer Portal
+	private logOAuthSetupInstructions() {
+		this.twitterService.log("=== TWITTER OAUTH SETUP INSTRUCTIONS ===", 'info');
+		this.twitterService.log("To set up Twitter OAuth correctly for this plugin:", 'info');
+		this.twitterService.log("1. Go to https://developer.x.com and log in", 'info');
+		this.twitterService.log("2. Navigate to your App's settings in the developer portal", 'info');
+		this.twitterService.log("3. Under 'User authentication settings', ensure OAuth 2.0 is enabled", 'info');
+		this.twitterService.log("4. Set App type to 'Native App' (or 'Web App' if running on a server)", 'info');
+		this.twitterService.log("5. Add EXACTLY this URL to the 'Callback URLs / Redirect URLs' section:", 'info');
+		this.twitterService.log("   obsidian://bookmark-bridge/callback", 'info');
+		this.twitterService.log("6. Make sure the URL is saved in your app settings", 'info');
+		this.twitterService.log("7. IMPORTANT: The URL format with '/callback' is correctly registered", 'info');
+		this.twitterService.log("   in the plugin's protocol handlers", 'info');
+		this.twitterService.log("===================================", 'info');
+	}
+
+	/**
+	 * Register all protocol handlers for the OAuth redirect flow
+	 */
+	private registerProtocolHandlers(): void {
+		// Option 1: Register handler for full "bookmark-bridge/callback" as an action
+		this.twitterService.log("Registering protocol handler for 'bookmark-bridge/callback'", "debug");
+		this.registerObsidianProtocolHandler("bookmark-bridge/callback", (params: Record<string, string>) => {
+			this.twitterService.log("CALLBACK TRIGGERED: Protocol handler for 'bookmark-bridge/callback' with params: " + JSON.stringify(params), "info");
+			this.handleAuthCallback(params);
+		});
+		
+		// Option 2: Register handler for "bookmark-bridge" which might receive the "callback" as a parameter
+		this.twitterService.log("Registering protocol handler for 'bookmark-bridge'", "debug");
+		this.registerObsidianProtocolHandler("bookmark-bridge", (params: Record<string, string>) => {
+			this.twitterService.log("CALLBACK TRIGGERED: Protocol handler for 'bookmark-bridge' with params: " + JSON.stringify(params), "info");
+			this.handleAuthCallback(params);
+		});
+	}
 }
 
 class BookmarkBridgeSettingTab extends PluginSettingTab {
@@ -353,16 +748,14 @@ class BookmarkBridgeSettingTab extends PluginSettingTab {
 
 	display(): void {
 		const { containerEl } = this;
-		containerEl.empty();
+		(containerEl as any).innerHTML = ''; // Clear previous content
 
-		// Add some CSS for the authorization elements
+		// Optional: Add some CSS (can be moved to styles.css)
 		containerEl.createEl('style', {
 			text: `
-				.auth-example {
-					font-family: monospace;
-					background-color: var(--background-secondary);
-					padding: 8px;
-					border-radius: 4px;
+				.auth-status-container {
+					margin-top: 10px;
+					margin-bottom: 20px;
 				}
 				.oauth2-status {
 					margin-top: 8px;
@@ -375,214 +768,56 @@ class BookmarkBridgeSettingTab extends PluginSettingTab {
 				.oauth2-status.disconnected {
 					background-color: var(--background-modifier-error);
 				}
-				.auth-code-input {
-					width: 100%;
-					font-family: monospace;
-				}
-				.auth-help-text {
-					margin-top: 8px;
-					font-size: 0.8rem;
-					color: var(--text-muted);
-				}
-				.auth-help-text.success {
-					color: var(--text-success);
-				}
-				.error-text {
-					color: var(--text-error);
-				}
-				.auth-code-container {
-					margin-top: 16px;
-					display: none;
-				}
-				.auth-code-container.visible {
-					display: block;
-				}
-				.bookmark-bridge-storage-method {
-					margin-top: 16px;
-				}
-				.bookmark-bridge-sync-button {
-					margin-top: 16px;
-				}
 			`
 		});
 
 		containerEl.createEl('h2', { text: 'Bookmark Bridge Settings' });
 
+		// --- X API Documentation Link ---
 		new Setting(containerEl)
-			.setName('X API Documentation')
-			.setDesc('Learn how to get your X API credentials')
+			.setName('X API Setup Guide')
+			.setDesc('Learn how to get your X API credentials for the OAuth 2.0 PKCE flow. This is required to use the plugin.')
 			.addButton((button: ButtonComponent) => button
-				.setButtonText('View Guide')
+				.setButtonText('View Setup Guide')
 				.onClick(() => {
-					window.open('https://github.com/yourrepo/bookmark-bridge/wiki/Twitter-API-Setup-Guide', '_blank');
+					// Replace with your actual guide URL if you have one
+					window.open('https://developer.x.com/en/docs/authentication/oauth-2-0/authorization-code', '_blank'); 
 				}));
 
-		containerEl.createEl('h3', { text: 'X API Credentials' });
+		// --- X API Credentials & Authentication Status Section ---
+		containerEl.createEl('h3', { text: 'X API Configuration (OAuth 2.0)' });
 		
-		// Connection Status Banner - Moved right below the X API Credentials header
-		const statusDiv = containerEl.createDiv();
-		const statusText = this.plugin.twitterService.hasOAuth2Credentials() ? 
-			'✓ Connected to X API' : '✗ Not connected to X API';
-		const statusClass = this.plugin.twitterService.hasOAuth2Credentials() ? 
-			'oauth2-status connected' : 'oauth2-status disconnected';
-		
-		const authStatus = document.createElement('div');
-		authStatus.className = statusClass;
-		authStatus.textContent = statusText;
-		statusDiv.appendChild(authStatus);
-		
-		// OAuth 2.0 credentials
+		// This div will be populated by renderAuthStatus with appropriate buttons/info
+		const authStatusEl = containerEl.createDiv({ cls: 'auth-status-container' });
+		this.renderAuthStatus(authStatusEl);
+
 		new Setting(containerEl)
 			.setName('Client ID')
-			.setDesc('Your X API Client ID from the Developer Portal')
+			.setDesc('Your X App\'s Client ID (from Twitter Developer Portal -> Project -> App -> Keys & Tokens).')
 			.addText((text: TextComponent) => text
 				.setPlaceholder('Enter your Client ID')
 				.setValue(this.plugin.settings.clientId)
 				.onChange(async (value: string) => {
-					this.plugin.settings.clientId = value;
+					this.plugin.settings.clientId = value.trim();
 					await this.plugin.saveSettings();
+					this.display(); // Refresh to update UI based on new Client ID (e.g., auth button state)
 				}));
 
+		// Client Secret is generally not used for PKCE public clients token exchange but might be needed for revocation if app is confidential.
 		new Setting(containerEl)
 			.setName('Client Secret (Optional)')
-			.setDesc('Your X API Client Secret from the Developer Portal. Required for confidential clients.')
+			.setDesc('Your X App\'s Client Secret. Needed if your app is \'Confidential\' and client authentication is required for token revocation.')
 			.addText((text: TextComponent) => text
-				.setPlaceholder('Enter your Client Secret')
+				.setPlaceholder('Enter your Client Secret if applicable')
 				.setValue(this.plugin.settings.clientSecret)
 				.onChange(async (value: string) => {
-					this.plugin.settings.clientSecret = value;
+					this.plugin.settings.clientSecret = value.trim();
 					await this.plugin.saveSettings();
 				}));
-		
-		if (this.plugin.twitterService.hasOAuth2Credentials()) {
-								// Test Connection and Sync buttons
-			new Setting(containerEl)
-			.setName('Test API Connection')
-			.setDesc('Verify your X API credentials')
-			.addButton((button) => button
-				.setButtonText('Test Connection')
-				.onClick(async () => {
-					try {
-						const isValid = await this.plugin.twitterService.testConnection();
-						if (isValid) {
-							new Notice('Connection successful! Your API credentials work.');
-						} else {
-							new Notice('Connection failed. Please check your API credentials.');
-						}
-					} catch (error) {
-						console.error('Connection test error:', error);
-						new Notice(`Connection test failed: ${(error as Error).message}`);
-					}
-				}));
 
-
-			new Setting(containerEl)
-				.setName('Revoke Access')
-				.setDesc('Disconnect from X API')
-				.addButton((button: ButtonComponent) => button
-					.setButtonText('Disconnect')
-					.onClick(async () => {
-						try {
-							await this.plugin.twitterService.revokeToken();
-							await this.plugin.saveSettings();
-							new Notice('Successfully disconnected from X API');
-							this.display(); // Refresh to update status
-						} catch (error) {
-							console.error('Error revoking token:', error);
-							new Notice(`Error disconnecting: ${(error as Error).message}`);
-						}
-					}));
-		} else {
-			// Authorization Step 1: Generate URL and open browser
-			new Setting(containerEl)
-				.setName('Step 1: Start Authorization')
-				.setDesc('Connect to X API to access your bookmarks')
-				.addButton(button => button
-					.setButtonText('Generate Authorization URL')
-					.onClick(async () => {
-						try {
-							if (!this.plugin.settings.clientId) {
-								new Notice('Please enter your Client ID first');
-								return;
-							}
-							
-							// Generate auth URL
-							const authInfo = await this.plugin.twitterService.generateAuthUrl();
-							
-							// Save settings to persist code verifier
-							await this.plugin.saveSettings();
-							
-							// Open browser window with auth URL
-							window.open(authInfo.url, '_blank');
-							
-							new Notice('Authorization page opened. After authorizing, copy the code from the URL and paste it below.');
-						} catch (error) {
-							console.error('Error generating auth URL:', error);
-							new Notice(`Error: ${(error as Error).message}`);
-						}
-					}));
-			
-			// Show example URL
-			containerEl.createEl('div', {
-				text: 'Example URL: http://127.0.0.1/callback?code=ABCDEF...',
-				cls: 'auth-example'
-			});
-			
-			// Authorization Step 2: Enter the code
-			let authCode = '';
-			new Setting(containerEl)
-				.setName('Step 2: Enter Authorization Code')
-				.setDesc('After authorizing, paste the URL or code from your browser')
-				.addText(text => text
-					.setPlaceholder('Paste URL or code here')
-					.onChange(value => {
-						// If this looks like a URL, try to extract the code
-						if (value.includes('http') && value.includes('callback')) {
-							const extractedCode = this.plugin.twitterService.extractAuthorizationCode(value);
-							if (extractedCode) {
-								// Update the text field with just the extracted code
-								text.setValue(extractedCode);
-								authCode = extractedCode;
-								new Notice('Code extracted successfully!');
-								return;
-							}
-						}
-						authCode = value;
-					}));
-			
-			// Authorization Step 3: Submit code
-			new Setting(containerEl)
-				.setName('Step 3: Complete Authorization')
-				.setDesc('Submit the authorization code to finish connecting')
-				.addButton(button => button
-					.setButtonText('Submit Code')
-					.onClick(async () => {
-						if (!authCode) {
-							new Notice('Please enter the authorization code first');
-							return;
-						}
-						
-						try {
-							await this.plugin.twitterService.exchangeAuthCodeForToken(authCode);
-							await this.plugin.saveSettings();
-							new Notice('Successfully connected to X API!');
-							
-							// Start auto-sync if enabled
-							if (this.plugin.settings.autoSync) {
-								this.plugin.startAutoSync();
-							}
-							
-							this.display(); // Refresh to update status
-						} catch (error) {
-							console.error('Error exchanging auth code:', error);
-							new Notice(`Authorization failed: ${(error as Error).message}`);
-						}
-					}));
-		}
-
+		// --- Storage Settings ---
 		containerEl.createEl('h3', { text: 'Storage Settings' });
 
-		// Storage Method - Single radio choice instead of separate settings
 		new Setting(containerEl)
 			.setName('Storage Method')
 			.setDesc('Choose how to store your Twitter bookmarks')
@@ -603,32 +838,30 @@ class BookmarkBridgeSettingTab extends PluginSettingTab {
 				.setPlaceholder('e.g., Twitter/Bookmarks')
 				.setValue(this.plugin.settings.targetFolder)
 				.onChange(async (value: string) => {
-					this.plugin.settings.targetFolder = value;
+					this.plugin.settings.targetFolder = value.trim();
 					await this.plugin.saveSettings();
 				}));
 
-		// Show single file name input if 'single' storage method is selected
 		if (this.plugin.settings.storageMethod === 'single') {
 			new Setting(containerEl)
-				.setName('File Name')
-				.setDesc('Name of the file for combined bookmarks')
+				.setName('File Name for Single Note')
+				.setDesc('Name of the .md file if using single note storage.')
 				.addText((text) => text
 					.setPlaceholder('e.g., twitter-bookmarks.md')
 					.setValue(this.plugin.settings.singleFileName)
 					.onChange(async (value: string) => {
-						// Ensure the filename ends with .md
-						if (!value.endsWith('.md')) {
-							value += '.md';
+						let fileName = value.trim();
+						if (!fileName.endsWith('.md')) {
+							fileName += '.md';
 						}
-						this.plugin.settings.singleFileName = value;
+						this.plugin.settings.singleFileName = fileName;
 						await this.plugin.saveSettings();
 					}));
 		}
 
-		// Custom Templates section
+		// --- Template Settings ---
 		containerEl.createEl('h3', { text: 'Template Settings' });
-		
-		// Use custom templates toggle
+		// ... (template settings remain the same, ensure they are below this point)
 		new Setting(containerEl)
 			.setName('Use Custom Templates')
 			.setDesc('Enable custom templates for formatting bookmarks')
@@ -642,38 +875,24 @@ class BookmarkBridgeSettingTab extends PluginSettingTab {
 				return toggle;
 			});
 		
-		// Only show template settings if custom templates are enabled
 		if (this.plugin.settings.useCustomTemplate) {
-			// Template Help - Documentation link instead of listing variables
 			new Setting(containerEl)
 				.setName('Template Variables Documentation')
-				.setDesc('View the complete list of available template variables and API parameters')
+				.setDesc('View the list of available template variables.') // Simplified description
 				.addButton((button: ButtonComponent) => button
 					.setButtonText('View Documentation')
 					.onClick(() => {
-						// This will open the docs in the default app
-						// For published plugins, use an absolute URL to the GitHub documentation
-						const basePath = (this.plugin.app.vault.adapter as any).basePath || '';
-						const docPath = `${basePath}/docs/x-api-parameters.md`;
-						
-						// Try to use the system's default program to open the markdown file
-						try {
-							require('electron').shell.openPath(docPath);
-						} catch (e) {
-							// Fallback for web version or if electron fails
-							new Notice('Documentation file available at: docs/x-api-parameters.md');
-							console.log('Documentation path:', docPath);
-						}
+						// Link to your plugin's documentation for template variables
+						window.open('https://github.com/your-repo/bookmark-bridge/wiki/Template-Variables', '_blank');
 					}));
 			
-			// Template
 			new Setting(containerEl)
-				.setName('Template')
-				.setDesc('Template for all bookmark formats')
+				.setName('Bookmark Note Template')
+				.setDesc('Define the template for how bookmarks are formatted as notes.')
 				.addTextArea((textArea: TextAreaComponent) => {
 					textArea.setValue(this.plugin.settings.template);
 					textArea.inputEl.rows = 10;
-					textArea.inputEl.cols = 60;
+					textArea.inputEl.cols = 60; // Ensure this doesn't break layout, adjust if needed
 					textArea.onChange(async (value: string) => {
 						this.plugin.settings.template = value;
 						await this.plugin.saveSettings();
@@ -681,29 +900,27 @@ class BookmarkBridgeSettingTab extends PluginSettingTab {
 					return textArea;
 				});
 			
-			// Reset to defaults button
 			new Setting(containerEl)
 				.setName('Reset Template')
-				.setDesc('Reset template to default value')
+				.setDesc('Reset template to the default value.')
 				.addButton((button) => {
-					button.setButtonText('Reset to Defaults');
+					button.setButtonText('Reset to Default');
 					button.onClick(async () => {
 						this.plugin.settings.template = DEFAULT_SETTINGS.template;
 						await this.plugin.saveSettings();
 						this.display(); // Refresh UI
-						new Notice('Template reset to defaults');
+						new Notice('Template reset to default');
 					});
 					return button;
 				});
 		}
 
-		// Automatic sync options
+		// --- Sync Settings ---
 		containerEl.createEl('h3', { text: 'Sync Settings' });
 		
-		// Auto sync toggle
 		new Setting(containerEl)
 			.setName('Automatic Syncing')
-			.setDesc('Automatically sync bookmarks without manual intervention')
+			.setDesc('Automatically sync bookmarks periodically in the background.')
 			.addToggle((toggle) => {
 				toggle.setValue(this.plugin.settings.autoSync);
 				toggle.onChange(async (value) => {
@@ -711,40 +928,117 @@ class BookmarkBridgeSettingTab extends PluginSettingTab {
 					await this.plugin.saveSettings();
 					
 					if (value) {
-						// Start the auto sync if it was just enabled
 						this.plugin.startAutoSync();
-						new Notice('Automatic syncing enabled and started');
+						new Notice('Automatic syncing enabled and started.');
 					} else {
-						// Clear the timer if auto sync was disabled
 						if (this.plugin.syncTimer) {
 							clearTimeout(this.plugin.syncTimer);
 							this.plugin.syncTimer = null;
 						}
-						new Notice('Automatic syncing disabled');
+						new Notice('Automatic syncing disabled.');
 					}
 				});
 			});
 		
-		// Sync button
 		new Setting(containerEl)
 			.setName('Manual Sync')
-			.setDesc('Manually sync your X bookmarks to Obsidian')
+			.setDesc('Manually trigger a sync of your X bookmarks to Obsidian.')
 			.addButton((button) => button
 				.setButtonText('Sync Now')
 				.onClick(async () => {
 					await this.plugin.syncBookmarks();
 				}));
 
-		containerEl.createEl('div', { text: `Last sync: ${this.formatLastSync()}`, cls: 'bookmark-bridge-last-sync' });
+		containerEl.createEl('div', { text: `Last sync: ${this.formatLastSync()}`, cls: 'bookmark-bridge-last-sync setting-item-description' });
+		containerEl.createEl('div', { text: `Sync status: ${this.formatSyncStatus()}`, cls: 'bookmark-bridge-sync-status setting-item-description' });
 		
-		// Add sync status info
-		containerEl.createEl('div', { text: `Sync status: ${this.formatSyncStatus()}`, cls: 'bookmark-bridge-sync-status' });
-		
-		// Rate limit note moved to the bottom
 		containerEl.createEl('div', {
-			text: 'Note: X API limits bookmarks requests to 1 per 15 minutes for free Developer accounts. Pagination is handled automatically over multiple sync sessions.',
+			text: 'Note: X API limits bookmarks requests to 1 per 15 minutes for free Developer accounts. Pagination is handled automatically over multiple sync sessions if needed.',
 			cls: 'setting-item-description'
 		});
+	}
+
+	private renderAuthStatus(containerEl: HTMLElement) {
+		(containerEl as any).innerHTML = ''; // Clear previous content
+
+		// Display current connection status
+		const isConnected = this.plugin.twitterService.hasOAuth2Credentials();
+		const statusText = isConnected 
+			? '✓ Connected to X API' 
+			: '✗ Not connected to X API. Please provide your Client ID and click Authenticate.';
+		const statusClass = isConnected 
+			? 'oauth2-status connected' 
+			: 'oauth2-status disconnected';
+		containerEl.createEl('div', { text: statusText, cls: statusClass });
+
+		if (isConnected) {
+			// User is authenticated - show Re-authenticate and Log Out options
+			new Setting(containerEl)
+				.setName('Account Actions')
+				.setDesc('Manage your X API connection.')
+				.addButton(button => button
+					.setButtonText('Re-authenticate')
+					.setTooltip('If you encounter issues, try authenticating with Twitter again.')
+					.onClick(async () => {
+						if (!this.plugin.settings.clientId) {
+							new Notice('Client ID is missing. Please enter it above.');
+							return;
+						}
+						await this.plugin.initiateTwitterAuth();
+					}))
+				.addButton(button => button
+					.setButtonText('Log Out / Revoke Token')
+					.setWarning()
+					.setTooltip('Disconnect the plugin from your Twitter account and revoke its access.')
+					.onClick(async () => {
+						new Notice('Attempting to log out from Twitter...');
+						const success = await this.plugin.twitterService.revokeToken();
+						if (success) {
+							new Notice('Logged out from Twitter and local tokens cleared.');
+						} else {
+							// Even if revoke fails (e.g. token already invalid), settings are cleared locally in revokeToken.
+							new Notice('Logout attempt finished. Local tokens cleared.');
+						}
+						this.display(); // Refresh the settings tab to show updated status
+					}));
+		} else {
+			// User is not authenticated - show Authenticate button
+			new Setting(containerEl)
+				.setName('Connect to Twitter')
+				.setDesc('Authorize the plugin to access your Twitter bookmarks. Ensure your Client ID is entered above.')
+				.addButton(button => button
+					.setButtonText('Authenticate with Twitter')
+					.setCta() // Call to action style
+					.setDisabled(!this.plugin.settings.clientId) // Disable if no Client ID
+					.onClick(async () => {
+						if (!this.plugin.settings.clientId) {
+							new Notice('Please enter your Client ID in the setting above before authenticating.');
+							return;
+						}
+						await this.plugin.initiateTwitterAuth();
+					}));
+		}
+
+		// Test Connection Button - always show but disable if not authenticated
+		new Setting(containerEl)
+		.setName('Test API Connection')
+		.setDesc('Verify if the plugin can communicate with the Twitter API using current credentials.')
+		.addButton(button => button
+			.setButtonText('Test Connection')
+			.setDisabled(!isConnected) 
+			.onClick(async () => {
+				if (!isConnected) {
+					new Notice('Not authenticated. Please authenticate with Twitter first.');
+					return;
+				}
+				new Notice('Testing Twitter connection...');
+				const success = await this.plugin.twitterService.testConnection();
+				if (success) {
+					new Notice('Twitter connection successful!');
+				} else {
+					new Notice('Twitter connection failed. Please check your credentials or try re-authenticating.');
+				}
+			}));
 	}
 
 	formatLastSync(): string {

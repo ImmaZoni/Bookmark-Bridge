@@ -1,15 +1,26 @@
 import { App } from 'obsidian';
 
+/**
+ * Interface for storing processed bookmarks
+ * Maps bookmark ID to timestamp when it was processed
+ */
 interface ProcessedBookmarks {
-    [key: string]: number; // Maps bookmark ID to timestamp when it was processed
+    [key: string]: number;
 }
 
+/**
+ * Interface for storing detailed bookmark records
+ */
 export interface BookmarkRecord {
     tweetId: string;
     filePath: string;
     importDate: Date;
 }
 
+/**
+ * Handles storage and retrieval of bookmark processing status
+ * Provides persistence for tracking which bookmarks have already been imported
+ */
 export class BookmarkStorage {
     private app: App;
     private processedBookmarks: ProcessedBookmarks = {};
@@ -18,6 +29,10 @@ export class BookmarkStorage {
     private RECORDS_KEY = 'bookmark-bridge-records';
     private dataLoaded = false;
 
+    /**
+     * Creates a new BookmarkStorage instance
+     * @param app The Obsidian App instance
+     */
     constructor(app: App) {
         this.app = app;
         this.loadData();
@@ -25,6 +40,7 @@ export class BookmarkStorage {
 
     /**
      * Load previously processed bookmarks and records from plugin data
+     * Uses localStorage for persistence across plugin reloads
      */
     private async loadData(): Promise<void> {
         if (this.dataLoaded) return;
@@ -61,7 +77,8 @@ export class BookmarkStorage {
     }
 
     /**
-     * Save the current processed bookmarks and records to plugin data
+     * Save the current processed bookmarks and records to localStorage
+     * Ensures persistence across plugin reloads
      */
     private async saveData(): Promise<void> {
         try {
@@ -103,6 +120,7 @@ export class BookmarkStorage {
 
     /**
      * Clear all processed bookmarks
+     * Useful for forcing a full re-sync
      */
     public async clearProcessedBookmarks(): Promise<void> {
         this.processedBookmarks = {};
