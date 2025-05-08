@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as https from 'https';
 import * as url from 'url';
+import * as http from 'http';
 
 interface BookmarkBridgeSettings {
     // OAuth 2.0 credentials
@@ -30,6 +31,9 @@ interface BookmarkBridgeSettings {
     initialSyncComplete: boolean; // Whether we've completed the initial full sync
     lastSyncPage: number; // Last page of bookmarks we've synced
     lastSyncTime: number; // Timestamp of the last sync attempt (for rate limit tracking)
+    
+    // Debug settings
+    bypassRateLimit: boolean; // DEBUG ONLY: Bypass the built-in rate limit check
 }
 
 interface TwitterUser {
@@ -139,12 +143,17 @@ export class TwitterService {
     }
 
     private initializeClient() {
-        // Initialize with OAuth 2.0
-        if (this.settings.oauth2AccessToken) {
-            this.log('Initializing Twitter client with OAuth 2.0 access token');
+        if (!this.settings.oauth2AccessToken) {
+            this.log('Cannot initialize client: No access token available', 'error');
+            return;
+        }
+
+        try {
+            this.log('Initializing Twitter API client with access token', 'info');
             this.client = new TwitterApi(this.settings.oauth2AccessToken);
-        } else {
-            this.log('Missing OAuth 2.0 access token', 'error');
+            this.log('Twitter API client initialized successfully', 'info');
+        } catch (error) {
+            this.log(`Failed to initialize Twitter API client: ${error}`, 'error');
             this.client = null;
         }
     }
@@ -339,17 +348,37 @@ export class TwitterService {
     }
 
     /**
-     * Perform an HTTP request using Node.js https module instead of fetch to avoid CORS issues
-     * @param urlString The URL to request
-     * @param options Request options
-     * @param postData Optional data to send for POST requests
+     * Make a HTTP request with detailed logging
      */
-    private async nodeHttpRequest(urlString: string, options: any, postData?: string): Promise<{ statusCode: number, headers: any, body: string }> {
+    private async nodeHttpRequest(
+        requestUrl: string | URL, 
+        options: https.RequestOptions = {}, 
+        postData?: string
+    ): Promise<{ statusCode: number; headers: http.IncomingHttpHeaders; body: string }> {
+        // Log the API call before making the request
+        const method = options.method || 'GET';
+        const urlStr = requestUrl.toString();
+        this.log(`API REQUEST: ${method} ${urlStr}`, 'info');
+        
+        if (options.headers) {
+            this.log(`Request headers: ${JSON.stringify(options.headers, (k, v) => 
+                k === 'Authorization' ? 'Bearer [REDACTED]' : v)}`, 'debug');
+        }
+        
+        if (postData) {
+            // Log post data with sensitive info redacted
+            const redactedData = postData.replace(/(client_secret|code|token|refresh_token)=([^&]+)/g, '$1=[REDACTED]');
+            this.log(`Request body: ${redactedData}`, 'debug');
+        }
+        
+        // Update the rate limit timestamp for any API call
+        await this.updateRateLimitTimestamp();
+        
         return new Promise((resolve, reject) => {
-            this.log(`Making Node.js HTTPS request to: ${urlString}`, 'debug');
+            this.log(`Making Node.js HTTPS request to: ${urlStr}`, 'debug');
             
             // Parse the URL to get hostname, path, etc.
-            const parsedUrl = new URL(urlString);
+            const parsedUrl = new URL(urlStr);
             
             // Set up the request options
             const requestOptions = {
@@ -361,7 +390,8 @@ export class TwitterService {
                 timeout: 10000 // 10 second timeout
             };
             
-            this.log(`Request options: ${JSON.stringify(requestOptions)}`, 'debug');
+            this.log(`Request options: ${JSON.stringify(requestOptions, (k, v) => 
+                k === 'headers' && v.Authorization ? {...v, Authorization: 'Bearer [REDACTED]'} : v)}`, 'debug');
             
             const req = https.request(requestOptions, (res) => {
                 let data = '';
@@ -371,7 +401,52 @@ export class TwitterService {
                 });
                 
                 res.on('end', () => {
+                    // Log response data
                     this.log(`Response status code: ${res.statusCode}`, 'debug');
+                    
+                    // Log response headers with special handling for rate limit headers
+                    const rateLimitHeaders = Object.entries(res.headers)
+                        .filter(([key]) => key.toLowerCase().includes('ratelimit') || key.toLowerCase().includes('x-rate-limit'))
+                        .reduce((obj, [k, v]) => ({ ...obj, [k]: v }), {});
+                    
+                    if (Object.keys(rateLimitHeaders).length > 0) {
+                        this.log(`Rate limit headers: ${JSON.stringify(rateLimitHeaders)}`, 'info');
+                    }
+                    
+                    // Redact sensitive data in response for logging
+                    let logData = data;
+                    try {
+                        const jsonData = JSON.parse(data);
+                        // Redact tokens in response
+                        if (jsonData.access_token) jsonData.access_token = '[REDACTED]';
+                        if (jsonData.refresh_token) jsonData.refresh_token = '[REDACTED]';
+                        logData = JSON.stringify(jsonData);
+                    } catch (e) {
+                        // Not JSON, just use as is
+                    }
+                    
+                    if (res.statusCode === 429) {
+                        this.log(`RATE LIMIT EXCEEDED - Response body: ${logData}`, 'error');
+                        
+                        // Extract retry-after header if present
+                        const retryAfter = res.headers['retry-after'];
+                        if (retryAfter) {
+                            this.log(`X API says to retry after: ${retryAfter} seconds`, 'info');
+                        }
+                        
+                        // Log debug info about the bypass setting
+                        if (this.settings.bypassRateLimit) {
+                            this.log(`NOTICE: You have rate limit bypass enabled, but the X API is still enforcing its own rate limits. You're hitting the actual API rate limit.`, 'error');
+                            this.log(`The client-side bypass only removes our rate limit handling, not X's server-side limits.`, 'info');
+                        } else {
+                            this.log(`TIP: For debugging, you can temporarily bypass the client-side rate limit in Settings > Debug Settings.`, 'info');
+                        }
+                    } else if (res.statusCode && res.statusCode >= 400) {
+                        this.log(`ERROR RESPONSE - Status ${res.statusCode}, body: ${logData}`, 'error');
+                    } else {
+                        this.log(`Response body: ${logData.length > 500 ? logData.substring(0, 500) + '...' : logData}`, 'debug');
+                    }
+                    
                     resolve({
                         statusCode: res.statusCode || 0,
                         headers: res.headers,
@@ -682,10 +757,22 @@ export class TwitterService {
         return !!this.settings.oauth2AccessToken;
     }
 
+    /**
+     * Test the connection to Twitter API
+     * This counts against the rate limit, so use sparingly
+     */
     public async testConnection(): Promise<boolean> {
         try {
+            // First check if we're rate limited before making the call
+            if (this.isRateLimited()) {
+                const timeElapsed = Date.now() - Math.max(this.lastApiCallTime, this.settings.lastSyncTime);
+                const timeToWait = Math.ceil((this.apiRateLimitWindow - timeElapsed) / 1000 / 60);
+                this.log(`TEST CONNECTION: Cannot proceed - still in rate limit window. Please wait ${timeToWait} more minutes.`, 'error');
+                return false;
+            }
+            
             if (!this.client) {
-                this.log('No Twitter client available, initializing...');
+                this.log('No Twitter client available, initializing...', 'info');
                 this.initializeClient();
                 if (!this.client) {
                     this.log('Failed to initialize Twitter client', 'error');
@@ -693,24 +780,44 @@ export class TwitterService {
                 }
             }
 
+            // Explicitly log this API call
+            this.log('API CALL: GET /2/users/me (test connection)', 'info');
+            
+            // Update the rate limit timestamp before making the call
+            await this.updateRateLimitTimestamp();
+            
             // Attempt to verify credentials by fetching user info
-            this.log('Testing connection to Twitter API...');
             const currentUser = await this.client.v2.me();
-            this.log(`Connection test response: ${JSON.stringify(currentUser)}`);
+            this.log(`Connection test response: ${JSON.stringify(currentUser)}`, 'info');
+            
             return !!currentUser.data.id;
         } catch (error) {
             this.log(`Twitter API connection test failed: ${error}`, 'error');
             
+            // Check if this is a rate limit error
+            const errorObj = error as any;
+            if (errorObj.code === 429 || (errorObj.errors && errorObj.errors[0]?.code === 88)) {
+                this.log('TEST CONNECTION: Rate limit reached', 'error');
+                // Still update rate limit timestamp on error
+                await this.updateRateLimitTimestamp();
+                return false;
+            }
+            
             // If we have a refresh token, try refreshing the access token
-            if (this.settings.oauth2RefreshToken) {
+            if (this.settings.oauth2RefreshToken && !this.isRateLimited()) {
                 try {
-                    this.log('Trying to refresh the access token...');
+                    this.log('Trying to refresh the access token...', 'info');
                     await this.refreshAccessToken();
                     
-                    // Try again with the new token
-                    if (this.client) {
+                    // Try again with the new token but only if we're not rate limited
+                    if (this.client && !this.isRateLimited()) {
+                        this.log('API CALL: GET /2/users/me (retry after token refresh)', 'info');
+                        // Update timestamp for this call too
+                        await this.updateRateLimitTimestamp();
                         const currentUser = await this.client.v2.me();
                         return !!currentUser.data.id;
+                    } else {
+                        this.log('Not retrying after token refresh due to rate limit', 'info');
                     }
                 } catch (refreshError) {
                     this.log(`Failed to refresh access token: ${refreshError}`, 'error');
@@ -726,22 +833,40 @@ export class TwitterService {
      * @returns True if rate limited, false if okay to proceed
      */
     private isRateLimited(): boolean {
+        // If rate limit bypass is enabled, always return false (not rate limited)
+        if (this.settings.bypassRateLimit) {
+            this.log(`⚠️ RATE LIMIT BYPASS: Rate limit check bypassed due to debug setting`, 'info');
+            return false;
+        }
+
         const now = Date.now();
-        const timeElapsed = now - Math.max(this.lastApiCallTime, this.settings.lastSyncTime);
+        const lastCallTime = this.lastApiCallTime || 0;
+        const lastSyncTime = this.settings.lastSyncTime || 0;
+        const lastRelevantTime = Math.max(lastCallTime, lastSyncTime);
+        
+        // If no previous calls have been made, we're not rate limited
+        if (lastRelevantTime === 0) {
+            this.log('No previous API calls detected, not rate limited', 'debug');
+            return false;
+        }
+        
+        const timeElapsed = now - lastRelevantTime;
         const isLimited = timeElapsed < this.apiRateLimitWindow;
         
         if (isLimited) {
             const timeToWait = Math.ceil((this.apiRateLimitWindow - timeElapsed) / 1000 / 60);
-            this.log(`Rate limited: Need to wait ${timeToWait} more minutes before API call. Last API call: ${new Date(this.lastApiCallTime).toLocaleTimeString()}, Last sync: ${new Date(this.settings.lastSyncTime).toLocaleTimeString()}`, 'info');
+            this.log(`⚠️ RATE LIMITED: Need to wait ${timeToWait} more minutes before API call.`, 'info');
             
             // Log more detailed debugging information
             this.log(`Rate limit details: 
                Current time: ${new Date(now).toISOString()}
-               Last API call: ${new Date(this.lastApiCallTime).toISOString()} 
-               Last sync time: ${new Date(this.settings.lastSyncTime).toISOString()}
+               Last API call: ${new Date(lastCallTime).toISOString()} 
+               Last sync time: ${new Date(lastSyncTime).toISOString()}
+               Most recent event: ${new Date(lastRelevantTime).toISOString()}
                Time elapsed: ${timeElapsed}ms
-               Rate limit window: ${this.apiRateLimitWindow}ms
-               Time remaining: ${this.apiRateLimitWindow - timeElapsed}ms`, 'debug');
+               Rate limit window: ${this.apiRateLimitWindow}ms (${this.apiRateLimitWindow/1000/60} minutes)
+               Time remaining: ${this.apiRateLimitWindow - timeElapsed}ms
+               Will be free at: ${new Date(lastRelevantTime + this.apiRateLimitWindow).toISOString()}`, 'debug');
         } else {
             this.log(`Not rate limited. Last API call was ${Math.floor(timeElapsed/1000/60)} minutes ago.`, 'debug');
         }
@@ -751,10 +876,23 @@ export class TwitterService {
     
     /**
      * Update the rate limit timestamp after making an API call
+     * Also saves to settings for persistence across restarts
      */
-    private updateRateLimitTimestamp(): void {
-        this.lastApiCallTime = Date.now();
+    private async updateRateLimitTimestamp(): Promise<void> {
+        const now = Date.now();
+        this.lastApiCallTime = now;
         this.log(`Updated API rate limit timestamp to ${new Date(this.lastApiCallTime).toISOString()}`, 'debug');
+        
+        // Also update the lastSyncTime in settings for persistence across restarts
+        this.settings.lastSyncTime = now;
+        
+        // Save settings to ensure rate limit info persists
+        try {
+            await this.saveSettingsCallback();
+            this.log('Saved rate limit info to settings file', 'debug');
+        } catch (error) {
+            this.log(`Error saving rate limit info: ${error}`, 'error');
+        }
     }
 
     public async fetchBookmarks(lastSyncTimestamp: number): Promise<TwitterBookmark[]> {
@@ -764,10 +902,15 @@ export class TwitterService {
             throw new Error('Another API call is already in progress. Please wait for it to complete.');
         }
         
-        // Check if we're rate limited
+        // Check if we're rate limited BEFORE making any calls
         if (this.isRateLimited()) {
             const timeElapsed = Date.now() - Math.max(this.lastApiCallTime, this.settings.lastSyncTime);
             const timeToWait = Math.ceil((this.apiRateLimitWindow - timeElapsed) / 1000 / 60);
+            const nextAllowedTime = new Date(Math.max(this.lastApiCallTime, this.settings.lastSyncTime) + this.apiRateLimitWindow);
+            
+            this.log(`⛔ RATE LIMIT CHECK: Cannot proceed with API call - still in rate limit window.`, 'error');
+            this.log(`Next allowed time: ${nextAllowedTime.toISOString()} (in ${timeToWait} minutes)`, 'info');
+            
             throw new Error(`X API rate limit not reset yet. Please wait approximately ${timeToWait} more minutes before trying again.`);
         }
         
@@ -776,21 +919,46 @@ export class TwitterService {
         
         try {
             if (!this.client) {
+                this.log('Twitter client not initialized, attempting to initialize now', 'info');
                 this.initializeClient();
                 if (!this.client) {
+                    this.log('Failed to initialize Twitter client', 'error');
                     throw new Error('Twitter client not initialized. Check your API credentials or authorize with X.');
                 }
             }
 
-            // Update the rate limit timestamp
-            this.updateRateLimitTimestamp();
+            // Log that we're making the "me" API call
+            this.log(`STARTING BOOKMARKS SYNC: Retrieving user information first`, 'info');
+            this.log('API CALL: GET /2/users/me (to get user ID)', 'info');
             
-            // Update the last sync time in settings
-            this.settings.lastSyncTime = Date.now();
-            await this.saveSettingsCallback(); // Save right after updating the timestamp
+            // Update the rate limit timestamp for the me() API call
+            await this.updateRateLimitTimestamp();
+            this.log(`API timestamp updated to prevent rapid consecutive calls`, 'debug');
+            
+            let currentUser;
+            try {
+                currentUser = await this.client.v2.me();
+                this.log(`API RESPONSE: User ID ${currentUser.data.id} retrieved successfully`, 'info');
+            } catch (userError: any) {
+                this.log(`Error getting current user: ${userError}`, 'error');
+                
+                if (userError.code === 429 || (userError.errors && userError.errors[0]?.code === 88)) {
+                    this.log(`RATE LIMIT REACHED on GET /2/users/me call`, 'error');
+                    // Get reset time if available
+                    const resetTimeRaw = userError.rateLimit?.reset;
+                    let waitTimeMsg = '15 minutes';
+                    if (resetTimeRaw) {
+                        const resetTime = new Date(resetTimeRaw * 1000);
+                        const waitMinutes = Math.ceil((resetTime.getTime() - Date.now()) / (1000 * 60));
+                        waitTimeMsg = `${waitMinutes} minutes (until ${resetTime.toISOString()})`;
+                    }
                     
-            // Get the user's ID first (required for bookmarks endpoint)
-            const currentUser = await this.client.v2.me();
+                    throw new Error(`X API rate limit exceeded on user info request. Please wait ${waitTimeMsg} before trying again.`);
+                }
+                
+                throw userError; // re-throw if not a rate limit error
+            }
+            
             const userId = currentUser.data.id;
 
             // Store all bookmarks here
@@ -814,7 +982,7 @@ export class TwitterService {
             }
             
             // Log the rate limit info
-            this.log(`Rate limit: 1 request per 15 minutes per user.`, 'info');
+            this.log(`⚠️ RATE LIMIT INFO: X API allows 1 request per 15 minutes per user.`, 'info');
 
             // Track if we've made a request in this session
             let madeRequest = false;
@@ -823,49 +991,80 @@ export class TwitterService {
                 requestCount++;
                 madeRequest = true;
                 
-                this.log(`Making bookmarks request ${requestCount}/${MAX_REQUESTS}${paginationToken ? ' with pagination token' : ''}`);
+                this.log(`API CALL: GET /2/users/${userId}/bookmarks (request ${requestCount}/${MAX_REQUESTS})`, 'info');
                 
-                // Fetch bookmarks with parameters
-                const bookmarksResponse = await this.client.v2.bookmarks({
-                    expansions: ['author_id', 'attachments.media_keys'],
-                    'user.fields': ['name', 'username'],
-                    'media.fields': ['url', 'preview_image_url'],
-                    'tweet.fields': ['created_at'],
-                    max_results: 100, // Maximum allowed
-                    pagination_token: paginationToken
-                });
+                // Log detailed parameters
+                this.log(`API parameters: expansions=[author_id,attachments.media_keys], user.fields=[name,username], media.fields=[url,preview_image_url], tweet.fields=[created_at], max_results=100${paginationToken ? `, pagination_token=${paginationToken.substring(0, 10)}...` : ''}`, 'debug');
                 
-                // Process the current page of bookmarks
-                const bookmarks = this.processBookmarksPage(bookmarksResponse, this.settings.initialSyncComplete ? lastSyncTimestamp : 0);
-                allBookmarks.push(...bookmarks);
+                // Update timestamp BEFORE making the API call
+                await this.updateRateLimitTimestamp();
                 
-                // Update the last sync page
-                this.settings.lastSyncPage++;
-                
-                // Check for rate limit headers
-                if (bookmarksResponse.rateLimit) {
-                    this.log(`Rate limit remaining: ${bookmarksResponse.rateLimit.remaining}/${bookmarksResponse.rateLimit.limit}`, 'debug');
-                    this.log(`Rate limit resets at: ${new Date(bookmarksResponse.rateLimit.reset * 1000).toISOString()}`, 'debug');
-                }
-                
-                // Check if there's another page
-                if (bookmarksResponse.meta && bookmarksResponse.meta.next_token) {
-                    // Save the pagination token for the next run
-                    this.settings.nextPaginationToken = bookmarksResponse.meta.next_token;
-                    this.log(`Found next pagination token: ${this.settings.nextPaginationToken.substring(0, 10)}...`, 'debug');
-                    this.log(`There are more bookmarks available. You'll need to sync again in 15 minutes to continue.`, 'info');
+                try {
+                    // Fetch bookmarks with parameters
+                    const bookmarksResponse = await this.client.v2.bookmarks({
+                        expansions: ['author_id', 'attachments.media_keys'],
+                        'user.fields': ['name', 'username'],
+                        'media.fields': ['url', 'preview_image_url'],
+                        'tweet.fields': ['created_at'],
+                        max_results: 100, // Maximum allowed
+                        pagination_token: paginationToken
+                    });
                     
-                    // Not done with initial sync
-                    this.settings.initialSyncComplete = false;
-                    await this.saveSettingsCallback(); // Save after updating pagination info
-                    break;
-                } else {
-                    // No more pages, we've completed the initial sync
-                    this.settings.nextPaginationToken = '';
-                    this.settings.initialSyncComplete = true;
-                    this.log('No more pages available, reached the end of all bookmarks', 'info');
-                    await this.saveSettingsCallback(); // Save after completing sync
-                    break;
+                    this.log(`API RESPONSE: Received bookmarks response with status OK, found ${bookmarksResponse.data.data?.length || 0} bookmark(s)`, 'info');
+                    
+                    // Process the current page of bookmarks
+                    const bookmarks = this.processBookmarksPage(bookmarksResponse, this.settings.initialSyncComplete ? lastSyncTimestamp : 0);
+                    allBookmarks.push(...bookmarks);
+                    
+                    // Update the last sync page
+                    this.settings.lastSyncPage++;
+                    
+                    // Check for rate limit headers
+                    if (bookmarksResponse.rateLimit) {
+                        this.log(`RATE LIMIT HEADERS: Remaining=${bookmarksResponse.rateLimit.remaining}/${bookmarksResponse.rateLimit.limit}, Reset=${new Date(bookmarksResponse.rateLimit.reset * 1000).toISOString()}`, 'info');
+                    }
+                    
+                    // Check if there's another page
+                    if (bookmarksResponse.meta && bookmarksResponse.meta.next_token) {
+                        // Save the pagination token for the next run
+                        this.settings.nextPaginationToken = bookmarksResponse.meta.next_token;
+                        this.log(`PAGINATION: Found next pagination token: ${this.settings.nextPaginationToken.substring(0, 10)}...`, 'debug');
+                        this.log(`⚠️ MORE DATA AVAILABLE: There are more bookmarks available. You'll need to sync again in 15 minutes to continue.`, 'info');
+                        
+                        // Not done with initial sync
+                        this.settings.initialSyncComplete = false;
+                        await this.saveSettingsCallback(); // Save after updating pagination info
+                        break;
+                    } else {
+                        // No more pages, we've completed the initial sync
+                        this.settings.nextPaginationToken = '';
+                        this.settings.initialSyncComplete = true;
+                        this.log('SYNC COMPLETE: No more pages available, reached the end of all bookmarks', 'info');
+                        await this.saveSettingsCallback(); // Save after completing sync
+                        break;
+                    }
+                } catch (bookmarkError: any) {
+                    this.log(`Error fetching bookmarks: ${bookmarkError}`, 'error');
+                    
+                    // Enhanced rate limit error handling
+                    if (bookmarkError.code === 429 || (bookmarkError.errors && bookmarkError.errors[0]?.code === 88)) {
+                        this.log(`RATE LIMIT REACHED on GET /2/users/${userId}/bookmarks call`, 'error');
+                        
+                        // Extract any rate limit information
+                        if (bookmarkError.rateLimit) {
+                            const resetTime = new Date(bookmarkError.rateLimit.reset * 1000);
+                            this.log(`Rate limit reset time: ${resetTime.toISOString()}`, 'info');
+                        }
+                        
+                        // Still update rate limit timestamp
+                        await this.updateRateLimitTimestamp();
+                        
+                        // Throw with better message
+                        throw new Error(`X API rate limit exceeded. Please try again in 15 minutes.`);
+                    }
+                    
+                    // Re-throw the error
+                    throw bookmarkError;
                 }
             }
             
@@ -873,13 +1072,23 @@ export class TwitterService {
                 this.log('No bookmarks request made in this session due to rate limits', 'info');
             }
 
-            this.log(`Retrieved ${allBookmarks.length} bookmarks in this sync session`, 'info');
+            this.log(`SYNC SUMMARY: Retrieved ${allBookmarks.length} bookmarks in this sync session`, 'info');
             return allBookmarks;
         } catch (error) {
-            this.log(`Error fetching Twitter bookmarks: ${error}`, 'error');
+            this.log(`ERROR FETCHING TWITTER BOOKMARKS: ${error}`, 'error');
+            
+            // Enhanced error logging
+            const errorObj = error as any;
+            if (errorObj.code || (errorObj.errors && errorObj.errors.length > 0)) {
+                this.log(`API error details: ${JSON.stringify({
+                    code: errorObj.code,
+                    errors: errorObj.errors,
+                    status: errorObj.status,
+                    rateLimit: errorObj.rateLimit
+                }, null, 2)}`, 'error');
+            }
             
             // Check if this is a rate limit error
-            const errorObj = error as any;
             if (errorObj.code === 429 || (errorObj.errors && errorObj.errors[0]?.code === 88)) {
                 const resetTimeHeader = errorObj.rateLimit?.reset;
                 let waitMessage = 'X API rate limit exceeded. Please try again in 15 minutes.';
@@ -890,7 +1099,15 @@ export class TwitterService {
                     waitMessage = `X API rate limit exceeded. Please try again in ${waitMinutes} minutes.`;
                 }
                 
-                this.updateRateLimitTimestamp(); // Update timestamp on rate limit error
+                await this.updateRateLimitTimestamp(); // Update timestamp on rate limit error
+                
+                // Add debug info about bypass setting
+                if (!this.settings.bypassRateLimit) {
+                    this.log(`TIP: For debugging, you can temporarily bypass the client-side rate limit in Settings > Debug Settings. This won't prevent X API 429 errors but will bypass the waiting period between requests.`, 'info');
+                } else {
+                    this.log(`NOTICE: You have rate limit bypass enabled, but received a 429 error from X API. This confirms you are hitting the actual API rate limit.`, 'error');
+                }
+                
                 this.log(waitMessage, 'error');
                 throw new Error(waitMessage);
             }
@@ -972,5 +1189,44 @@ export class TwitterService {
         }
 
         return bookmarks;
+    }
+
+    /**
+     * Check if we're currently rate limited - can be called by external code
+     * @returns True if rate limited, false if not
+     * @throws Error with descriptive message if rate limited
+     */
+    public async checkRateLimitStatus(): Promise<boolean> {
+        // If rate limit bypass is enabled, always return false (not rate limited)
+        if (this.settings.bypassRateLimit) {
+            this.log(`⚠️ RATE LIMIT BYPASS: Rate limit check bypassed due to debug setting`, 'info');
+            return false;
+        }
+
+        const now = Date.now();
+        const lastCallTime = this.lastApiCallTime || 0;
+        const lastSyncTime = this.settings.lastSyncTime || 0;
+        const lastRelevantTime = Math.max(lastCallTime, lastSyncTime);
+        
+        // If no previous calls have been made, we're not rate limited
+        if (lastRelevantTime === 0) {
+            this.log('No previous API calls detected, not rate limited', 'debug');
+            return false;
+        }
+        
+        const timeElapsed = now - lastRelevantTime;
+        const isLimited = timeElapsed < this.apiRateLimitWindow;
+        
+        if (isLimited) {
+            const timeToWait = Math.ceil((this.apiRateLimitWindow - timeElapsed) / 1000 / 60);
+            const nextAllowedTime = new Date(lastRelevantTime + this.apiRateLimitWindow);
+            
+            const errorMessage = `X API rate limit active. Please wait approximately ${timeToWait} more minutes (until ${nextAllowedTime.toLocaleTimeString()}).`;
+            this.log(`RATE LIMIT CHECK: ${errorMessage}`, 'info');
+            throw new Error(errorMessage);
+        }
+        
+        this.log('Rate limit check passed - API is available', 'debug');
+        return false;
     }
 } 

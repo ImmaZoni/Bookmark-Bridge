@@ -33,6 +33,9 @@ interface BookmarkBridgeSettings {
 	// Automatic sync settings
 	autoSync: boolean; // Whether to automatically sync bookmarks
 	syncInProgress: boolean; // Whether a sync is currently in progress
+	
+	// Debug settings
+	bypassRateLimit: boolean; // DEBUG ONLY: Bypass the built-in rate limit check
 }
 
 const DEFAULT_SETTINGS: BookmarkBridgeSettings = {
@@ -83,7 +86,10 @@ date: "{{date}} {{time}}"
 	
 	// Automatic sync defaults
 	autoSync: true,
-	syncInProgress: false
+	syncInProgress: false,
+	
+	// Debug defaults
+	bypassRateLimit: false
 };
 
 export default class BookmarkBridgePlugin extends Plugin {
@@ -228,10 +234,16 @@ export default class BookmarkBridgePlugin extends Plugin {
 		}
 		
 		// Don't schedule a new sync if one is already in progress or we're in cooldown
-		if (this.settings.syncInProgress || this.isInCooldown()) {
+		// Skip cooldown check if bypass is enabled
+		if (this.settings.syncInProgress || (!this.settings.bypassRateLimit && this.isInCooldown())) {
 			const reason = this.settings.syncInProgress ? 'sync in progress' : 'in cooldown period';
 			this.twitterService.log(`Not scheduling sync: ${reason}`, 'info');
 			return;
+		}
+		
+		// If rate limit bypass is enabled, log it
+		if (this.settings.bypassRateLimit) {
+			this.twitterService.log(`⚠️ DEBUG: Bypassing rate limit window for scheduling due to debug setting`, 'info');
 		}
 		
 		// Calculate time since last sync attempt
@@ -243,8 +255,9 @@ export default class BookmarkBridgePlugin extends Plugin {
 		if (!this.settings.initialSyncComplete) {
 			// We need to continue with pagination or start the initial sync
 			
-			if (this.settings.lastSyncTime === 0 || timeElapsed >= RATE_LIMIT_WINDOW) {
-				// We can sync now - either first sync ever or rate limit window passed
+			// Either bypass rate limit check or check elapsed time
+			if (this.settings.bypassRateLimit || this.settings.lastSyncTime === 0 || timeElapsed >= RATE_LIMIT_WINDOW) {
+				// We can sync now - either first sync ever or rate limit window passed or bypass enabled
 				this.twitterService.log(`Auto-starting sync ${this.settings.lastSyncPage > 0 ? 'continuation' : 'initial'}`, 'info');
 				await this.syncBookmarks(true);
 			} else {
@@ -273,11 +286,19 @@ export default class BookmarkBridgePlugin extends Plugin {
 			}
 		} else if (this.settings.autoSync) {
 			// Initial sync complete, but we'll check again in 1 hour for new bookmarks
-			const CHECK_INTERVAL = 60 * 60 * 1000; // 1 hour in milliseconds
-			this.twitterService.log(`Initial sync complete, scheduling routine check in 1 hour`, 'info');
+			// Use a shorter interval if bypass is enabled
+			const CHECK_INTERVAL = this.settings.bypassRateLimit ? 
+				1 * 60 * 1000 : // 1 minute if bypassing
+				60 * 60 * 1000; // 1 hour normally
+				
+			const timeDesc = this.settings.bypassRateLimit ? '1 minute (debug mode)' : '1 hour';
+			this.twitterService.log(`Initial sync complete, scheduling routine check in ${timeDesc}`, 'info');
 			
 			// Set a short cooldown to prevent immediate re-triggering
-			this.setCooldown(30 * 1000); // 30 second cooldown
+			// Skip if bypass is enabled
+			if (!this.settings.bypassRateLimit) {
+				this.setCooldown(30 * 1000); // 30 second cooldown
+			}
 			
 			if (this.syncTimer) {
 				clearTimeout(this.syncTimer);
@@ -298,7 +319,8 @@ export default class BookmarkBridgePlugin extends Plugin {
 		}
 		
 		// Check if we're in cooldown or a sync is already in progress
-		if (this.isInCooldown()) {
+		// Skip cooldown check if bypass is enabled
+		if (!this.settings.bypassRateLimit && this.isInCooldown()) {
 			const waitTimeMs = this.nextAllowedSyncTime - Date.now();
 			const waitMinutes = Math.ceil(waitTimeMs / 1000 / 60);
 			const message = `Rate limit cooldown active. Please wait approximately ${waitMinutes} more minutes before syncing.`;
@@ -308,6 +330,34 @@ export default class BookmarkBridgePlugin extends Plugin {
 				new Notice(message, 5000);
 			}
 			return;
+		}
+		
+		// If bypass enabled, log it
+		if (this.settings.bypassRateLimit) {
+			this.twitterService.log(`⚠️ DEBUG: Bypassing rate limit cooldown check due to debug setting`, 'info');
+		}
+		
+		// Also check Twitter service's rate limit status directly
+		// Skip this check if bypass is enabled
+		if (!this.settings.bypassRateLimit) {
+			try {
+				// This will throw an error if rate limited
+				const isLimited = await this.twitterService.checkRateLimitStatus();
+				if (isLimited) {
+					this.twitterService.log('Rate limited according to Twitter service, aborting sync', 'info');
+					if (!isAutoSync) {
+						new Notice('Twitter API rate limit in effect. Please try again later.', 5000);
+					}
+					return;
+				}
+			} catch (error) {
+				const errorMessage = (error as Error).message;
+				this.twitterService.log(`Rate limit check error: ${errorMessage}`, 'error');
+				if (!isAutoSync) {
+					new Notice(`Cannot sync: ${errorMessage}`, 5000);
+				}
+				return;
+			}
 		}
 		
 		// Check if a sync is already in progress
@@ -955,6 +1005,43 @@ class BookmarkBridgeSettingTab extends PluginSettingTab {
 		containerEl.createEl('div', {
 			text: 'Note: X API limits bookmarks requests to 1 per 15 minutes for free Developer accounts. Pagination is handled automatically over multiple sync sessions if needed.',
 			cls: 'setting-item-description'
+		});
+
+		// --- Debug Settings ---
+		containerEl.createEl('h3', { text: 'Debug Settings' });
+		containerEl.createEl('div', { 
+			text: '⚠️ WARNING: These settings are for debugging only and may cause unexpected behavior or API errors.',
+			cls: 'setting-item-description bookmark-bridge-warning'
+		});
+
+		new Setting(containerEl)
+			.setName('Bypass Rate Limit Checks')
+			.setDesc('DEBUG ONLY: Disable the built-in rate limit check. May result in API errors (429) if you exceed X API limits.')
+			.addToggle((toggle) => {
+				toggle.setValue(this.plugin.settings.bypassRateLimit);
+				toggle.onChange(async (value) => {
+					this.plugin.settings.bypassRateLimit = value;
+					await this.plugin.saveSettings();
+					
+					if (value) {
+						new Notice('⚠️ Rate limit checks bypassed. Use with caution!', 5000);
+						this.plugin.twitterService.log('DEBUG: Rate limit bypass has been ENABLED', 'info');
+					} else {
+						new Notice('Rate limit checks enabled', 3000);
+						this.plugin.twitterService.log('DEBUG: Rate limit bypass has been DISABLED', 'info');
+					}
+				});
+			});
+
+		// Add some visible styling to the debug section
+		containerEl.createEl('style', {
+			text: `
+				.bookmark-bridge-warning {
+					color: var(--text-error);
+					margin-bottom: 12px;
+					font-weight: bold;
+				}
+			`
 		});
 	}
 
