@@ -24,6 +24,10 @@ Bookmark Bridge seamlessly imports your Twitter/X bookmarks into Obsidian, prese
 3. Enter your app's client ID in the plugin settings
 4. Follow the authorization steps in the plugin settings
 
+## Security Warning
+
+Please be aware that the `clientID` and `clientSecrets` are stored in `data.json` within the plugin folder. This poses an inherent security risk, as your API keys may be exposed. It is recommended to take appropriate measures to secure this file and avoid sharing it publicly.
+
 Detailed setup instructions are available in the plugin settings.
 
 ## Template Variables
