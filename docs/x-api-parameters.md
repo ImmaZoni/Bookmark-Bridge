@@ -217,10 +217,35 @@ This will output all hashtags from the tweet.
 
 ## Rate Limit Information
 
-Please note that the X API enforces rate limits on the bookmarks endpoint. The plugin handles these limits by implementing pagination and saving progress between sync sessions.
+The X API enforces strict rate limits on the bookmarks endpoint. These limits vary based on your subscription tier:
 
-- Bookmarks requests: 1 request per 15 minutes
-- Maximum results per request: 100 bookmarks 
+### API Tier Limits
+
+| Feature | Free Tier | Basic Tier ($100/mo) | Enterprise Tier |
+|---------|-----------|----------------------|-----------------|
+| Bookmarks API | 1 request / 15 minutes | 15 requests / 15 minutes | 50+ requests / 15 minutes |
+| Maximum results per request | 100 bookmarks | 100 bookmarks | 100 bookmarks |
+| Monthly request cap | 1,500 requests | 10,000 requests | Unlimited |
+
+### Current Status
+
+**⚠️ IMPORTANT: We are currently on the Free Tier and have reached our monthly API request limit.** 
+
+This means:
+1. New users may experience 429 errors when trying to sync bookmarks
+2. The plugin's functionality is temporarily limited for some users
+3. We need community support to upgrade to the Basic Tier
+
+The plugin handles these limits by implementing pagination and saving progress between sync sessions, but we cannot bypass Twitter's server-side rate limits and caps.
+
+### How You Can Help
+
+If you find this plugin valuable, please consider:
+1. **[Supporting our development](SUPPORTERS.md)** to help us upgrade to the Basic Tier
+2. **Testing the plugin** when our rate limits reset
+3. **Being patient** with the initial sync process, which may take several days for large bookmark collections
+
+For more detailed information about rate limits and how they affect our plugin, see [our Rate Limits documentation](RATE-LIMITS.md).
 
 ## Learn More
 

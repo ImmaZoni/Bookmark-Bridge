@@ -1043,6 +1043,43 @@ class BookmarkBridgeSettingTab extends PluginSettingTab {
 				}
 			`
 		});
+
+		// --- API Status Notice ---
+		containerEl.createEl('h3', { text: 'API Status Notice' });
+		const apiStatusEl = containerEl.createEl('div', {
+			cls: 'bookmark-bridge-api-status-notice'
+		});
+
+		// Add API status notice and styling
+		apiStatusEl.createEl('p', {
+			text: '⚠️ IMPORTANT: We have reached our monthly Twitter API request limit on the Free Tier.',
+			cls: 'bookmark-bridge-api-warning'
+		});
+
+		apiStatusEl.createEl('p', {
+			text: 'New users may experience 429 errors when trying to sync bookmarks. We need community support to upgrade to the paid API tier.'
+		});
+
+		apiStatusEl.createEl('p', {
+			text: 'Please see our README for information on how you can help us improve the plugin for everyone.'
+		});
+
+		// Styling for the API Status notice
+		containerEl.createEl('style', {
+			text: `
+				.bookmark-bridge-api-status-notice {
+					padding: 12px;
+					background-color: var(--background-modifier-error-hover);
+					border-left: 4px solid var(--text-error);
+					margin-bottom: 20px;
+					border-radius: 4px;
+				}
+				.bookmark-bridge-api-warning {
+					font-weight: bold;
+					margin-bottom: 8px;
+				}
+			`
+		});
 	}
 
 	private renderAuthStatus(containerEl: HTMLElement) {
