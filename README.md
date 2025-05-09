@@ -2,6 +2,21 @@
 
 Bookmark Bridge seamlessly imports your Twitter/X bookmarks into Obsidian, preserving valuable content in your knowledge base.
 
+## 🚨 Call for Testers & Supporters 🚨
+
+**We need your help!** Due to X API limitations, we've reached our monthly usage limit for bookmark API calls. We're looking for:
+
+1. **Testers** to help validate functionality across different environments and use cases
+2. **Supporters** willing to contribute to upgrading our Twitter API access tier
+
+### How You Can Help:
+
+- **Test the plugin**: Install it, provide feedback, and report any issues you encounter
+- **Support development**: 
+  - [Buy Me a Coffee](https://www.buymeacoffee.com/immazoni)
+
+Your contributions will help us upgrade to a paid Twitter API plan ($100/month) that allows for higher request limits and more features. All supporters will be acknowledged in the plugin documentation.
+
 ## Features
 
 - Import bookmarks from Twitter/X into your Obsidian vault
@@ -39,7 +54,9 @@ Bookmark Bridge offers two ways to store your bookmarks:
 
 ## Rate Limits
 
-The X API limits bookmark requests to 1 per 15 minutes. Bookmark Bridge handles this by implementing pagination and saving progress between sync sessions.
+The X API limits bookmark requests to 1 per 15 minutes for the free tier. Bookmark Bridge handles this by implementing pagination and saving progress between sync sessions.
+
+**Note:** We're currently on the free Twitter API tier, which has significant rate limits. With enough support, we plan to upgrade to a paid tier ($100/month) to improve sync capabilities and add more features.
 
 ## Contributing
 
@@ -48,3 +65,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
+
+## Acknowledgements
+
+Special thanks to all our [supporters and contributors](docs/SUPPORTERS.md) who make this project possible.
