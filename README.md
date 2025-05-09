@@ -58,6 +58,28 @@ The X API limits bookmark requests to 1 per 15 minutes for the free tier. Bookma
 
 **Note:** We're currently on the free Twitter API tier, which has significant rate limits. With enough support, we plan to upgrade to a paid tier ($100/month) to improve sync capabilities and add more features.
 
+## Future Vision
+
+Bookmark Bridge is designed to be more than just a Twitter/X bookmarks importer. Our long-term vision includes:
+
+### Multi-Platform Support
+- **Reddit**: Import saved posts and comments
+- **Hacker News**: Import upboted posts
+- **Bluesky**: Import saved posts
+- **LinkedIn**: Capture saved articles and posts
+- **Other Platforms**: Extend to additional services based on community needs
+
+### AI-Powered Organization
+- **Intelligent Categorization**: Leverage LLM capabilities to automatically sort bookmarks by topic
+- **Smart Tagging**: Generate relevant tags based on content analysis
+- **Content Summarization**: Create concise summaries of longer content
+
+### Enhanced Features
+- **Thread Unrolling**: Capture entire Twitter threads, not just individual tweets
+- **Advanced Media Handling**: Better support for various media types
+
+Our goal is to create a comprehensive "bridge" between all your content discovery platforms and your Obsidian knowledge base, making Bookmark Bridge an essential part of your PKM workflow.
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
